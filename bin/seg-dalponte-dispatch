@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# Author: Daniel Rode
+
+
+"""Segment crowns using Dalponte on the LMF P1 ITD, for the given field plots.
+"""
+
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Import
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
+# Import standard libraries
+import sys
+from pathlib import Path
+
+# Import in-house libraries
+from vogeler.sp import parallel
+from vogeler.const import TAO_PLOT_BUFF
+
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Constants
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
+WORKER_EXE = 'seg-dalponte'
+
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Functions
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
+def process_plot_set(plot_paths: list[Path]) -> None:
+    # Spawn workers for each plot
+    jobs = []
+    for plot_dir in plot_paths:
+        plot_bounds = (plot_dir / 'wkt.txt').read_text().strip()
+        jobs += [(
+            '--bounds-wkt', plot_bounds,
+            '--buffer', str(TAO_PLOT_BUFF),
+            str(plot_dir / "plot.las"),
+            str(plot_dir / "chm.tif"),
+            str(plot_dir / "ttops_lmf_las_p1.fgb"),
+            str(plot_dir),
+        )]
+
+    parallel(
+        jobs=jobs,
+        cmd=WORKER_EXE,
+        log_path=f"./{Path(WORKER_EXE).stem}-jobs.log",
+    )
+
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
+# Parse command line arguments
+DST = Path(sys.argv[1])
+
+# Ensure export directory exists
+DST.mkdir(exist_ok=True)
+
+# Process FS plots in parallel, segmenting crowns in each plot
+fs_plots = list((DST / "fs/").glob('*'))
+process_plot_set(fs_plots)
+
+print("DONE")

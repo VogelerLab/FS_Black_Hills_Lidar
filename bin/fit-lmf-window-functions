@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# Author: Daniel Rode
+
+
+"""Fit LMF window function equation to FS field data and FVS data."""
+
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Import
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
+# Import standard libraries
+import sys
+import json
+from pathlib import Path
+
+from collections.abc import Iterator
+
+# Import in-house libraries
+from vogeler.extlib import get_field_and_fvs_data_from_src
+
+# Import external libraries
+import numpy as np
+from sklearn.metrics import r2_score
+from sklearn.linear_model import QuantileRegressor
+
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Constants
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
+from vogeler.const import Y_FLOOR
+
+FIG_DPI = 600
+FIG_MARKER_SIZE = 0.1
+
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Functions
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
+def get_model_fit(
+    x: np.ndarray, y: np.ndarray, degree_max=5,
+) -> Iterator[(np.ndarray, float, str)]:
+    """Fit and score all models with given dataset."""
+
+    x = np.array(x, dtype=float)
+    y = np.array(y, dtype=float)
+
+    for degree in reversed(range(degree_max)):
+        try:
+            coeffs = np.polyfit(x, y, degree)
+        except np.linalg.LinAlgError:
+            return None
+
+        y_pred = np.polyval(coeffs, x)
+        r2 = r2_score(y, y_pred)
+
+        eq_terms = [
+            f"{co:.4f}x^{exp}" for exp, co in enumerate(reversed(coeffs))
+        ]
+        equation = ' + '.join(reversed(eq_terms))
+
+        yield (equation, r2, coeffs)
+
+
+def get_quantile_fits(
+    x: np.ndarray, y: np.ndarray, quantile_set: list,
+) -> Iterator[(float, np.ndarray, str)]:
+    """Fit various quantiles of dataset's linear regression."""
+
+    x = np.array(x, dtype=float)
+    y = np.array(y, dtype=float)
+
+    for quantile in quantile_set:
+        qr = QuantileRegressor(quantile=quantile, alpha=0)
+        qr.fit(x[:, np.newaxis], y)
+
+        coeffs = list(qr.coef_) + [qr.intercept_]
+
+        eq_terms = [
+            f"{co:.4f}x^{exp}" for exp, co in enumerate(reversed(coeffs))
+        ]
+        equation = ' + '.join(reversed(eq_terms))
+
+        yield (quantile, equation, coeffs)
+
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
+# Parse command line arguments
+DST = Path(sys.argv[1])
+fvs_results_path = Path(sys.argv[2])
+
+# Ensure destination directory exists
+DST.mkdir(exist_ok=True, parents=True)
+
+# Import Forest Service field data and FVS data
+_, _, field_trees = get_field_and_fvs_data_from_src(fvs_results_path)
+
+# Only keep entries where tree height was measured
+field_trees = field_trees.query('Height_Measurement == "YES"')
+
+# Drop unnecessary columns and rows with NA from joined data
+cols = [
+    'Ht',  # FVS
+    'Height',  # Field data
+    'CrWidth',  # FVS
+    'Ht_m',  # FVS
+    'Height_m',  # Field data
+    'CrWidth_m',  # FVS
+    'Species',  # Field data
+]
+field_trees = field_trees[cols].dropna()
+print("Filtered data entries (count):", len(field_trees))
+
+# Find what model best describes data (linear, polynomial, etc...)
+model_scores_m = list(  # These equations are in meters
+    get_model_fit(field_trees['Height_m'], field_trees['CrWidth_m'])
+)
+with open(DST / "model-scores-m.json", 'w') as f:
+    json.dump(
+        {
+            len(coeffs) - 1: {  # Polynomial degree
+                'equation': eq,
+                'R2_score': r2,
+                'coefficients': [float(i) for i in coeffs],
+            }
+            for eq, r2, coeffs in model_scores_m
+        },
+        f, indent=4,
+    )
+
+# Fit some quantiles of dataset's linear regression
+quantile_set = [0.01, 0.05, 0.10, 0.15, 0.20, 0.25]
+quantile_fits = dict()
+for q, eq, coeffs in get_quantile_fits(
+    field_trees['Height_m'],
+    field_trees['CrWidth_m'],
+    quantile_set=quantile_set,
+):
+    quantile_fits[q] = {
+        'equation': eq,
+        'coefficients': [float(i) for i in coeffs],
+    }
+
+with open(DST / "model-quantiles-m.json", 'w') as f:
+    json.dump(quantile_fits, f, indent=4)
+
+# Generate R code to test out potential LMF window functions
+def dump_r_wf(model_name, m, b):
+    return f"""
+        wf_{model_name} = function(x) {{
+            y = ({m} * x) + {b}
+            y[y > Y_CAP] = Y_CAP
+            y[y < Y_FLOOR] = Y_FLOOR
+            return(y)
+        }}\n\n
+    """
+
+model_list = []
+with (DST / "wf_set.r").open('w') as f:
+    f.write("\n\nY_FLOOR = ")
+    f.write(str(float(Y_FLOOR)))
+    f.write('\n\n')
+
+    models_json_path = DST / "model-scores-m.json"
+    data = json.loads(models_json_path.read_text())
+    model_name = 'p50'
+    model_list += [model_name]
+    m, b = data["1"]['coefficients']  # Select linear model
+    f.write(dump_r_wf(model_name, m, b))
+
+    data = json.loads((DST / "model-quantiles-m.json").read_text())
+    for k in data:
+        model_name = f"p{int(float(k) * 100)}"
+        model_list += [model_name]
+        m, b = data[k]['coefficients']
+        f.write(dump_r_wf(model_name, m, b))
+
+    f.write("wf_list = list(")
+    f.write(','.join(
+        [f"{i} = wf_{i}" for i in model_list]
+    ))
+    f.write(")")
+
+# Termination message
+print("Done")

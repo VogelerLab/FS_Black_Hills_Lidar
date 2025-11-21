@@ -1,0 +1,172 @@
+#!/usr/bin/env Rscript
+# Author: Daniel Rode
+
+
+# Identify tree tops (TAO points) from watershed crowns.
+
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Import libraries
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
+# Import external libraries
+library(sf, warn.conflicts = FALSE)
+library(lidR, warn.conflicts = FALSE)
+
+# Import shared code
+source("/vogeler/lib/r/shared.r")
+
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Constants
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
+# Text printed when user calls this script without proper parameters
+HELP_TEXT = "Usage: this.r [OPTIONS] LAS_PATH CROWNS_SHP_PATH DST_SHP"
+
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
+# Warn that lidar is expected to already be height normalized
+message("WARNING: This script expects points to already be height normalized")
+
+# Parse command line arguments
+clip_input = FALSE
+clip_output = FALSE
+
+pos_args = character()
+args = commandArgs(trailingOnly = TRUE)
+counter = 1
+while (TRUE) {
+    a = args[counter]
+    if (is.na(a) || a == "--") {
+        break
+    } else if (!startsWith(a, "-")) {
+        pos_args = c(pos_args, a)
+    } else if (a == "--bounds-wkt") {
+        clip_input = TRUE
+        plot_wkt = args[counter + 1]
+        counter = counter + 1
+    } else if (a == "--buffer") {
+        clip_output = TRUE
+        plot_buffer = as.numeric(args[counter + 1])
+        counter = counter + 1
+    } else {
+        stop("Invalid flag: ", a)
+    }
+    counter = counter + 1
+}
+
+if (length(pos_args) != 3) {
+    cat(HELP_TEXT)
+    quit(status = 1)
+}
+ctg_pth = pos_args[1]
+shp_pth = pos_args[2]
+dst_pth = pos_args[3]
+
+cat("Args: ")
+dput(args)
+
+for (p in c(ctg_pth, shp_pth)) {
+    if (! file.exists(p)) {
+        stop("Path does not exist: ", p)
+    }
+}
+
+# Import/load lidar data
+pdf(NULL)
+ctg = lidR::readLAScatalog(
+    ctg_pth,
+    select=LIDAR_ATTR_FILTER,
+    filter=LIDAR_POINT_FILTER,
+    progress=FALSE  # Disable some lidR progress bars
+)
+if (clip_input) {
+    plot_boundary = sf::st_as_sfc(plot_wkt) |> try(silent=TRUE)
+    if (any(class(plot_boundary) == "try-error")) {
+        stop("Invalid WKT: ", plot_wkt)
+    }
+    plot_boundary_plus_buff = plot_boundary
+    if (clip_output) (
+        plot_boundary_plus_buff = sf::st_buffer(plot_boundary, plot_buffer)
+    )
+    las = lidR::clip_roi(ctg, plot_boundary_plus_buff)
+} else {
+    plot_boundary = ctg$geometry
+    plot_boundary_plus_buff = plot_boundary
+    if (clip_output) (
+        plot_boundary = sf::st_buffer(plot_boundary, -plot_buffer)
+    )
+    las = lidR::readLAS(ctg)
+}
+if (is.empty(las)) {
+    message("Clip is empty")
+    quit()
+}
+
+# Wrap boundary polygon into spatial dataframe object
+plot_boundary = sf::st_as_sf(plot_boundary, crs=lidR::crs(ctg))
+plot_boundary_plus_buff = sf::st_as_sf(
+    plot_boundary_plus_buff, crs=lidR::crs(ctg)
+)
+
+# Discard low to the ground and below ground returns
+las = lidR::filter_poi(las, Z >= HIGHPASS_DELIM)
+
+# Discard high-in-the-sky returns
+las = lidR::filter_poi(las, Z < LOWPASS_DELIM)
+
+# If no points remain, quit
+if (is.empty(las)) {
+    message("No points remain after filtering")
+    quit()
+}
+
+# Import/load crown data
+crowns = sf::st_read(shp_pth)
+
+# Locate tree tops inside each crown polygon
+ttops_x = list()
+ttops_y = list()
+ttops_z = list()
+for (i in seq_len(nrow(crowns))) {
+    clipped_las = lidR::clip_roi(las, crowns$geometry[i])
+    max_z_index = which.max(clipped_las@data$Z)
+    highest_point = clipped_las@data[max_z_index, ]
+
+    # Store the results
+    ttops_x[[i]] = highest_point$X
+    ttops_y[[i]] = highest_point$Y
+    ttops_z[[i]] = highest_point$Z
+}
+
+ttops = do.call(rbind, Map(data.frame,
+    x=ttops_x,
+    y=ttops_y,
+    z=ttops_z
+))
+
+# Convert ttops plain dataframe into spatial dataframe
+ttops = sf::st_as_sf(
+    ttops,
+    coords=c("x", "y"),
+    crs=sf::st_crs(crowns)
+)
+
+# Write individual tree detection locations to file
+sf::write_sf(
+    sf::st_intersection(ttops, plot_boundary),  # Drop trees in buffer area
+    dst_pth
+)
+
+# Inform that job completed
+cat("DONE", "\n")

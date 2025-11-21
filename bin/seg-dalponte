@@ -1,0 +1,275 @@
+#!/usr/bin/env Rscript
+# Author: Daniel Rode
+
+
+# Identify and delineate (segment) trees using Dalponte and save to shapefiles.
+
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Import libraries
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
+# Import external libraries
+library(sf, warn.conflicts = FALSE)
+library(terra, warn.conflicts = FALSE)
+library(lidR, warn.conflicts = FALSE)
+
+
+# Import shared code
+source("/vogeler/lib/r/shared.r")
+
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Constants
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
+# Text printed when user calls this script without proper parameters
+HELP_TEXT = "Usage: this.r [OPTION]... LAS_PATH CHM_PATH ITD_PATH OUT_DIR"
+
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
+# Warn that lidar is expected to already be height normalized
+message("WARNING: This script expects points to already be height normalized")
+
+# Parse command line arguments
+clip_input = FALSE
+clip_output = FALSE
+
+pos_args = character()
+args = commandArgs(trailingOnly = TRUE)
+counter = 1
+while (TRUE) {
+    a = args[counter]
+    if (is.na(a) || a == "--") {
+        break
+    } else if (!startsWith(a, "-")) {
+        pos_args = c(pos_args, a)
+    } else if (a == "--bounds-wkt") {
+        clip_input = TRUE
+        plot_wkt = args[counter + 1]
+        counter = counter + 1
+    } else if (a == "--buffer") {
+        clip_output = TRUE
+        plot_buffer = as.numeric(args[counter + 1])
+        counter = counter + 1
+    } else {
+        stop("Invalid flag: ", a)
+    }
+    counter = counter + 1
+}
+
+if (length(pos_args) != 4) {
+    cat(HELP_TEXT)
+    quit(status = 1)
+}
+ctg_pth = pos_args[1]
+chm_pth = pos_args[2]
+itd_pth = pos_args[3]
+out_dir = pos_args[4]
+
+cat("Args: ")
+dput(args)
+
+for (p in c(ctg_pth, chm_pth, itd_pth)) {
+    if (! file.exists(p)) {
+        stop("Path does not exist: ", p)
+    }
+}
+
+# Ensure export directory exists
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Import/load lidar data
+pdf(NULL)
+ctg = lidR::readLAScatalog(
+    ctg_pth,
+    select=LIDAR_ATTR_FILTER,
+    filter=LIDAR_POINT_FILTER,
+    progress=FALSE  # Disable some lidR progress bars
+)
+if (clip_input) {
+    plot_boundary = sf::st_as_sfc(plot_wkt) |> try(silent=TRUE)
+    if (any(class(plot_boundary) == "try-error")) {
+        stop("Invalid WKT: ", plot_wkt)
+    }
+    plot_boundary_plus_buff = plot_boundary
+    if (clip_output) (
+        plot_boundary_plus_buff = sf::st_buffer(plot_boundary, plot_buffer)
+    )
+    las = lidR::clip_roi(ctg, plot_boundary_plus_buff)
+} else {
+    plot_boundary = ctg$geometry
+    plot_boundary_plus_buff = plot_boundary
+    if (clip_output) (
+        plot_boundary = sf::st_buffer(plot_boundary, -plot_buffer)
+    )
+    las = lidR::readLAS(ctg)
+}
+if (is.empty(las)) {
+    message("Clip is empty")
+    quit()
+}
+
+# Wrap single polygon into spatial dataframe
+plot_boundary = sf::st_as_sf(plot_boundary, crs=lidR::crs(ctg))
+plot_boundary_plus_buff = sf::st_as_sf(
+    plot_boundary_plus_buff, crs=lidR::crs(ctg)
+)
+
+# Discard low to the ground and below ground returns
+las = lidR::filter_poi(las, Z >= HIGHPASS_DELIM)
+
+# Discard high-in-the-sky returns
+las = lidR::filter_poi(las, Z < LOWPASS_DELIM)
+
+# If no points remain, quit
+if (is.empty(las)) {
+    message("No points remain after filtering")
+    quit()
+}
+
+# Import/load CHM data
+chm = terra::rast(chm_pth)
+if (clip_input) {
+    chm = terra::crop(chm, plot_boundary_plus_buff, mask=TRUE)
+}
+
+# Import tree tops
+ttops = sf::st_read(itd_pth)
+
+# Tree segmentation using smoothed CHM
+dst_path = paste0(
+    out_dir,
+    "/dal_crowns_chmsmooth_",
+    DAL_TH_SEED,
+    "_",
+    DAL_TH_CR,
+    "_",
+    DAL_MAX_CR,
+    ".fgb"
+)
+if (file.exists(dst_path)) {
+    print(paste("Exists (skipping):", dst_path))
+} else {
+    # Smooth canopy height model
+    smooth_chm = get_smooth_chm(chm)
+
+    # Setup Dalponte method with smoothed CHM
+    its_algo = lidR::dalponte2016(
+        smooth_chm,
+        ttops,
+        th_seed = DAL_TH_SEED,
+        th_cr = DAL_TH_CR,
+        max_cr = DAL_MAX_CR
+    )
+
+    # Segment trees (ITS) and calculate statistics for each tree crown using
+    # smoothed CHM
+    las_dal = lidR::segment_trees(las, its_algo)
+    tree_stats = lidR::crown_metrics(
+        las_dal,
+        func=NULL,
+        geom=CROWN_GEOM
+    )
+
+    if (is.null(tree_stats)) {
+        message("No trees found. Will not write ", dst_path)
+    } else {
+        # Write individual tree segmentation and crown stats to file
+        sf::write_sf(tree_stats, dst_path)
+    }
+}
+
+# Tree segmentation using original CHM
+dst_path = paste0(
+    out_dir,
+    "/dal_crowns_chm_",
+    DAL_TH_SEED,
+    "_",
+    DAL_TH_CR,
+    "_",
+    DAL_MAX_CR,
+    ".fgb"
+)
+if (file.exists(dst_path)) {
+    print(paste("Exists (skipping):", dst_path))
+} else {
+    # Setup Dalponte method with original CHM
+    its_algo = lidR::dalponte2016(
+        chm,
+        ttops,
+        th_tree=TREE_HMIN,
+        th_seed=DAL_TH_SEED,
+        th_cr=DAL_TH_CR,
+        max_cr=DAL_MAX_CR
+    )
+
+    # Segment trees (ITS) and calculate statistics for each tree crown using
+    # original CHM
+    las_dal = lidR::segment_trees(las, its_algo)
+    tree_stats = lidR::crown_metrics(
+        las_dal,
+        func=NULL,
+        geom=CROWN_GEOM
+    )
+
+    if (is.null(tree_stats)) {
+        message("No trees found. Will not write ", dst_path)
+    } else {
+        # Write individual tree segmentation and crown stats to file
+        sf::write_sf(tree_stats, dst_path)
+    }
+}
+
+# Tree segmentation using original CHM and max_cr=10
+dst_path = paste0(
+    out_dir,
+    "/dal_crowns_chm_",
+    DAL_TH_SEED,
+    "_",
+    DAL_TH_CR,
+    "_",
+    "10",
+    ".fgb"
+)
+if (file.exists(dst_path)) {
+    print(paste("Exists (skipping):", dst_path))
+} else {
+    # Setup Dalponte method with original CHM
+    its_algo = lidR::dalponte2016(
+        chm,
+        ttops,
+        th_tree=TREE_HMIN,
+        th_seed=DAL_TH_SEED,
+        th_cr=DAL_TH_CR,
+        max_cr=10
+    )
+
+    # Segment trees (ITS) and calculate statistics for each tree crown using
+    # original CHM
+    las_dal = lidR::segment_trees(las, its_algo)
+    tree_stats = lidR::crown_metrics(
+        las_dal,
+        func=NULL,
+        geom=CROWN_GEOM
+    )
+
+    if (is.null(tree_stats)) {
+        message("No trees found. Will not write ", dst_path)
+    } else {
+        # Write individual tree segmentation and crown stats to file
+        sf::write_sf(tree_stats, dst_path)
+    }
+}
+
+# Inform that job completed
+cat("DONE", "\n")

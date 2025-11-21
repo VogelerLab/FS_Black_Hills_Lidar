@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# Author: Daniel Rode
+
+
+"""Segment crowns using watershed on lidar, for the given field plots."""
+
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Import
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
+# Import standard libraries
+import sys
+from pathlib import Path
+
+# Import in-house libraries
+from vogeler.sp import parallel
+
+# Import external libraries
+import pyogrio
+
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Constants
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
+from vogeler.const import TAO_PLOT_BUFF
+
+WORKER_EXE = 'seg-watershed'
+
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Functions
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
+def process_plot_set(plots_df, plot_id_col, plots_dir):
+    # Spawn workers for each plot
+    jobs = []
+    for plot_id, plot_geom in zip(plots_df[plot_id_col], plots_df.geometry):
+        dst_dir = plots_dir / str(plot_id)
+        jobs += [(
+            '--bounds-wkt', plot_geom.wkt,
+            '--buffer', str(TAO_PLOT_BUFF),
+            str(dst_dir / "plot.las"),
+            str(dst_dir / "chm.tif"),
+            str(dst_dir),
+        )]
+
+    parallel(
+        jobs=jobs,
+        cmd=WORKER_EXE,
+        log_path=f"./{Path(WORKER_EXE).stem}-{plots_dir.name}-jobs.log",
+        resume_failed=True,
+    )
+
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
+# Parse command line arguments
+DST = Path(sys.argv[1])
+fs_1220_bounds_path = Path(sys.argv[2])
+
+# Ensure export directory exists
+DST.mkdir(exist_ok=True)
+
+# Import forest service plot field data
+fs_plots = pyogrio.read_dataframe(fs_1220_bounds_path)
+
+# Process FS plots in parallel, segmenting crowns in each plot
+process_plot_set(fs_plots, 'Plot', DST / "fs")
+
+# Import experimental forest field plot data
+ef_plots = pyogrio.read_dataframe("./cache-ef-tree-count.fgb")
+
+# Process experimental forest plots in parallel, finding tree tops in each plot
+process_plot_set(ef_plots, 'PLOT_ID', DST / "ef")
+
+print("DONE")

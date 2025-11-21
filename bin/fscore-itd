@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# Author: Daniel Rode
+
+
+""""Score the performance of ITD methods on Experimental Forest data.
+
+Use F1-scores as performance metric.
+"""
+
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Import
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
+# Import standard libraries
+import sys
+from pathlib import Path
+
+# Import in-house libraries
+from vogeler.stdlib import sha1
+from vogeler.stdlib import feet2meters
+
+# Import external libraries
+import pyogrio
+import pandas as pd
+from shapely import Point
+from geopandas import GeoDataFrame
+from pandas import DataFrame
+
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Constants
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
+# Experimental Forest data half-acre plot radius
+from vogeler.const import EFOREST_PLOT_RADIUS  # For the half-acre plots
+
+# DBH to height threshold for experimental forest half-acre plot data
+from vogeler.const import EFOREST_BIG_TREE_DBH_Z_METERS  # meters
+
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Functions
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
+def itd_true_trees(itd_ttops, true_ttops) -> list[str]:
+    """Return list of ITD trees that match field data."""
+
+    itd_ttops['used'] = False
+    for ftree in true_ttops.iloc:
+        tree_point = ftree.geometry
+        itd_ttops['xy_dis'] = itd_ttops.geometry.distance(tree_point)
+        itd_ttops['z_dis'] = (itd_ttops['Z'] - ftree['HT_2023_m']).abs()
+        itd_ttops = itd_ttops.sort_values(by=['z_dis', 'xy_dis'])
+        matches = (
+            itd_ttops
+            .query('used == False')
+            .query('xy_dis < 3')
+            .query('z_dis < 2')
+        )
+        if len(matches) != 0:
+            itd_tree = matches['tree_id'].iloc[0]
+            itd_ttops[itd_ttops['tree_id'] == itd_tree]['used'] = True
+
+            yield itd_tree
+
+
+def score_itd(itd_ttops, true_ttops):
+    """Compute F1-score, recall, and precision for each ITD algo."""
+
+    itd_ttops['tree_id'] = itd_ttops.geometry.astype(str).apply(sha1)
+    tp = len(list(itd_true_trees(itd_ttops, true_ttops)))  # true positives
+    fn = len(true_ttops) - tp  # false negatives (missed trees)
+    fp = len(itd_ttops) - tp  # false positives (hallucinations)
+
+    return {
+        'itd_ttops_count': len(itd_ttops),
+        'true_ttops_count': len(true_ttops),
+        'itd_found_count': tp,
+        'itd_omitted_count': fn,
+        'itd_imagined_count': fp,
+        'recall': tp / (tp + fn),
+        'precision': tp / (tp + fp),
+        'f1': (2 * tp) / (2 * tp + fp + fn),
+    }
+
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
+# Parse command line arguments
+EFOREST_PLOTS_PATH = Path(sys.argv[1])  # Path to half-acre plot locations
+EFOREST_TREES_PATH = Path(sys.argv[2])  # Path to list of plot trees
+PLOT_PROD_DIR = Path(sys.argv[3])
+
+# Import experimental forest half-plot data
+plots = pyogrio.read_dataframe(EFOREST_PLOTS_PATH)
+plots['geometry'] = plots.buffer(EFOREST_PLOT_RADIUS)
+plots['PLOT_ID'] = plots['Plot']
+
+# Import experimental forest half-plot stem-mapped tree data
+field_trees = pyogrio.read_dataframe(EFOREST_TREES_PATH)
+field_trees['geometry'] = [
+    Point(x, y)
+    for x, y in zip(field_trees['Easting'], field_trees['Northing'])
+]
+field_trees = GeoDataFrame(
+    field_trees,
+    crs=plots.crs,
+)
+field_trees['PLOT_ID'] = field_trees.sjoin(plots)['PLOT_ID']
+field_trees['HT_2023_ft'] = pd.to_numeric(
+    field_trees['HT.2023.feet'],
+    errors='coerce',
+)
+field_trees['HT_2023_m'] = field_trees['HT_2023_ft'].apply(feet2meters)
+
+# Compute accuracy table for ITD methods
+eforest_plot_ids = [
+    i.name for i in Path(PLOT_PROD_DIR).glob('*')
+]
+score_set = []
+for ef_id in eforest_plot_ids:
+    print(ef_id)
+
+    plot_dir = Path(PLOT_PROD_DIR, ef_id)
+    plot_trees = (
+        field_trees
+        .query(f"PLOT_ID=='{ef_id}'")
+        .sort_values(by='HT_2023_ft', ascending=False)
+    )
+
+    bounds = pyogrio.read_dataframe(plot_dir / 'bounds.fgb')
+    bounds = bounds.geometry.union_all()
+
+    for itd_path in ([
+        *list(plot_dir.glob("ttops_lmf_*.fgb")),
+        *list(plot_dir.glob("ws_ttops_*.fgb")),
+    ]):
+        print(itd_path)
+
+        itd_trees = pyogrio.read_dataframe(itd_path)
+        if itd_path.name.startswith("ws_"):
+            itd_trees['Z'] = itd_trees['z']
+        itd_trees = itd_trees[itd_trees.intersects(bounds)]
+        itd_trees = itd_trees.query(f'Z > {EFOREST_BIG_TREE_DBH_Z_METERS}')
+        itd_trees = itd_trees.reset_index()
+
+        score = score_itd(itd_trees, plot_trees)
+        score['ef_plot_id'] = ef_id
+        score['ttops_model'] = itd_path.stem
+
+        score_set += [score]
+
+df_scores_by_plot = DataFrame(score_set)
+
+overall_score_set = []
+for model in set(df_scores_by_plot['ttops_model']):
+    print(model)
+
+    model_plot_scores = df_scores_by_plot.query(f'ttops_model == "{model}"')
+    sums = model_plot_scores.sum()
+
+    tp = sums['itd_found_count']
+    fn = sums['itd_omitted_count']
+    fp = sums['itd_imagined_count']
+
+    overall_score_set += [{
+        'ttops_model': model,
+        'recall': tp / (tp + fn),
+        'precision': tp / (tp + fp),
+        'f1': (2 * tp) / (2 * tp + fp + fn),
+    }]
+
+df_overall_scores = DataFrame(overall_score_set)
+
+# Print top 10 performing ITD models
+print(df_overall_scores.sort_values(by=["f1"]).head(10))

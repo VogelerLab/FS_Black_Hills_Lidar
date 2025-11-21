@@ -1,0 +1,323 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# Author: Daniel Rode
+
+
+"""Score the performance of each ITD method.
+
+Evaluate their various window size functions on various validation sets.
+"""
+
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Import
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
+# Import standard libraries
+import sys
+from pathlib import Path
+
+# Import in-house libraries
+from vogeler.stdlib import dispatch
+from vogeler.extlib import order_df_cols_by_abs_mean
+from vogeler.extlib import get_field_and_fvs_data_from_src
+
+# Import external libraries
+import pyogrio
+import pandas as pd
+import matplotlib.pyplot as plt
+from numpy import nan
+from numpy import inf
+
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Constants
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
+from vogeler.const import BIG_TREE_DBH_Z_METERS
+
+GRAPH_DPI = 300
+BOXPLOT_MEANPROPS = {
+    'marker': '+',
+    'markeredgecolor': 'red',
+}
+
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Functions
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
+def get_itd_tree_counts_worker(d: Path) -> dict:
+    """Count the number of trees found by each ITD method in a given plot."""
+
+    counts = {}
+    for lmf_ttops_path in d.glob("ttops_lmf_*.fgb"):
+        ttops = pyogrio.read_dataframe(lmf_ttops_path)
+        k_suf = (
+            lmf_ttops_path
+            .stem
+            .removeprefix('ttops_')
+        )
+
+        # Count trees that pass the Forest Service's DBH threshold for
+        # recording trees
+        ttops_dbh_thresh = ttops.query(f'Z >= {BIG_TREE_DBH_Z_METERS}')
+        counts['n_' + k_suf] = len(ttops_dbh_thresh)
+
+    for ws_ttops_path in d.glob("ws_ttops_*.fgb"):
+        ttops = pyogrio.read_dataframe(ws_ttops_path)
+        k_suf = (
+            ws_ttops_path
+            .stem
+            .replace("_ttops_", '_')
+        )
+
+        # Count trees that pass the Forest Service's DBH threshold for
+        # recording trees
+        ttops_dbh_thresh = ttops.query(f'z >= {BIG_TREE_DBH_Z_METERS}')
+        counts['n_' + k_suf] = len(ttops_dbh_thresh)
+
+    return counts
+
+
+def get_itd_tree_counts(plots_dir: Path) -> pd.DataFrame:
+    """Compile DataFrame of ITD tree count for each algo for each plot."""
+
+    plots_dir = Path(plots_dir)
+
+    counts = {}
+    for job, result in dispatch(
+        jobs=plots_dir.glob("*"),
+        worker=get_itd_tree_counts_worker,
+    ):
+        plot_id = job.name
+        counts[plot_id] = result
+
+    return (
+        pd.DataFrame(counts)
+        .transpose()
+        .reset_index()
+        .rename(columns={'index': 'PLOT_ID'})
+        .sort_values(by='PLOT_ID')
+    )
+
+
+def graph_algos_performance(
+    tree_counts,  # Table
+    itd_cols,  # List of column names for each ITD, with tree counts
+    boxplot_col_order_fn,  # Method to order df columns by
+    truth_col,  # Name of column of "observed" tree counts
+    subtitle,  # Graph subtitle
+    dst_dir,  # Output directory for graphs
+) -> (pd.DataFrame, pd.DataFrame):
+    """Graph ITD methods' performance."""
+
+    # Graph difference between ITD predicted tree counts vs observed tree
+    # counts
+    diff = {}
+    diff_norm = {}
+    for a in itd_cols:
+
+        diff[a] = tree_counts[a] - tree_counts[truth_col]
+        diff_norm[a] = (
+            (tree_counts[a] - tree_counts[truth_col]) / tree_counts[truth_col]
+        )
+
+        # Replace inf values with nan (inf happens where the observed tree
+        # count was zero because there is no clear way to define a
+        # normalized score for such cases)
+        diff_norm[a] = diff_norm[a].replace([-inf, inf], nan)
+
+    diff = pd.DataFrame(diff)
+    diff_norm = pd.DataFrame(diff_norm)
+
+    print("Graphing boxplots of predicted vs observed differences...")
+
+    def boxplot_algos(df, fliers, title, ylabel, dst):
+        fig, ax = plt.subplots()
+
+        # Graph boxplot
+        boxplot = df.boxplot(
+            ax=ax,
+            showfliers=fliers,
+            showmeans=True,
+            meanprops=BOXPLOT_MEANPROPS,
+        )
+        boxplot.set(
+            title=title,
+            xlabel="Local Maxima Filter Parameterization Test Runs",
+            ylabel=ylabel,
+        )
+        boxplot.tick_params(axis='x', labelrotation=70)
+
+        # Save boxplot
+        fig.savefig(
+            dst,
+            dpi=GRAPH_DPI,
+            bbox_inches='tight',
+        )
+
+    for fliers_on in (True, False):
+        if subtitle is None:
+            title = None
+        else:
+            title = (
+                "Difference Between Tree Count Predicted and Observed"
+                f"\nFliers={fliers_on}; {subtitle}"
+            )
+        boxplot_algos(
+            # Order columns by some metric and only keep top 10
+            boxplot_col_order_fn(diff).iloc[:, :10],
+            fliers_on,
+            title=title,
+            ylabel="Difference (in number of trees for each plot)",
+            dst=dst_dir / f"boxplot_diffs_fliers{fliers_on}.png",
+        )
+
+    for fliers_on in (True, False):
+        if subtitle is None:
+            title = None
+        else:
+            title = (
+                "Normalized Difference Between Tree Count Predicted and"
+                " Observed"
+                f"\nFliers Shown={fliers_on}; {subtitle}"
+            )
+        boxplot_algos(
+            order_df_cols_by_abs_mean(diff_norm).iloc[:, :10],
+            fliers_on,
+            title=title,
+            ylabel="Normalized Difference",
+            dst=dst_dir / f"boxplot_norm_diffs_fliers{fliers_on}.png",
+        )
+
+    return diff, diff_norm
+
+
+def get_diff_stats(diff, diff_norm):
+    diff_stats = (
+        diff
+        .std()
+        .to_frame(name='sd')
+    )
+    diff_stats = diff_stats.join(
+        diff
+        .mean()
+        .to_frame(name='mean')
+    )
+    diff_stats = diff_stats.join(
+        diff_norm
+        .std()
+        .to_frame(name='norm_sd')
+    )
+    diff_stats = diff_stats.join(
+        diff_norm
+        .mean()
+        .to_frame(name='norm_mean')
+    )
+
+    return diff_stats.reset_index().rename(columns={'index': 'algo'})
+
+
+def judge_algos_performance(
+    tree_counts: pd.DataFrame,
+    itd_cols: list[str],
+    truth_col: str,
+    graphs_subtitle: str|None,
+    dst_dir: Path,
+
+    # Sort boxplot columns in order of best performance (algos with
+    # means closer to zero performed better)
+    boxplot_col_order_fn=order_df_cols_by_abs_mean,
+):
+    """Judge the performance of a given ITD method.
+
+    Given a certain set of validation data, see how the various ITD algorithms
+    perform using graphs and tables.
+    """
+
+    # Ensure destination directory exists
+    dst_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save counts to CSV
+    tree_counts.to_csv(
+        dst_dir / "itd_algos_vs_observed_counts.csv",
+        index=False,
+    )
+
+    # Generate graphs based on observed vs ITD count differences
+    diff, diff_norm = graph_algos_performance(
+        tree_counts=tree_counts,
+        itd_cols=itd_cols,
+        boxplot_col_order_fn=boxplot_col_order_fn,
+        truth_col=truth_col,
+        subtitle=graphs_subtitle,
+        dst_dir=dst_dir,
+    )
+
+    # Save difference stats to CSV
+    diff_stats = get_diff_stats(diff, diff_norm)
+    diff_stats.to_csv(dst_dir / "diff_stats.csv", index=False)
+
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
+# Parse command line arguments
+DST = Path(sys.argv[1])
+fvs_1220_results_path = Path(sys.argv[2])
+field_plots_dir = Path(sys.argv[3])
+
+# Ensure export directory exists
+DST.mkdir(exist_ok=True, parents=True)
+
+# Import data
+print("Gathering various data...")
+_, _, fs_field_trees = get_field_and_fvs_data_from_src(fvs_1220_results_path)
+
+# Get number of trees manually counted in each FS plot by Forest Service in
+# field
+fs_field_tree_counts = (
+    fs_field_trees['Plot']
+    .value_counts()
+    .reset_index()
+    .rename(columns={'Plot': 'PLOT_ID', 'count': "FS"})
+    .sort_values(by='PLOT_ID')
+    .reset_index(drop=True)
+)
+
+# Get number of trees counted in each FS plot automatically via various ITD
+# algos
+print("Gathering ITD tree counts...")
+itd_fs_tree_counts = get_itd_tree_counts(field_plots_dir / "fs")
+itd_fs_tree_counts['PLOT_ID'] = itd_fs_tree_counts['PLOT_ID'].apply(
+    lambda x: int(float(x))
+)
+print("Moving on...")
+
+# Join FS field counts and ITD counts
+fs_tree_counts = pd.merge(
+    fs_field_tree_counts, itd_fs_tree_counts,
+    how='inner',
+    on='PLOT_ID',
+)
+
+# Judge how each algorithm performs on ITD with FS field counts as truth,
+itd_algos = list(filter(lambda x: x.startswith('n_'), fs_tree_counts.columns))
+print("Judging ITD tree counts against FS truth...")
+judge_algos_performance(
+    tree_counts=fs_tree_counts,
+    itd_cols=itd_algos,
+    truth_col='FS',
+    graphs_subtitle="Validation=FS",
+    dst_dir=DST / "fs",
+)

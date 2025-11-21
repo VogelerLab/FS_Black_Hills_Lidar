@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# Author: Daniel Rode
+
+
+"""Compute and print constants used throughout 2OD TAO workflow."""
+
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Import
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
+# Import standard library
+import sys
+from pathlib import Path
+
+# Import in-house libraries
+from vogeler.stdlib import acre2sqft
+from vogeler.stdlib import feet2meters
+from vogeler.stdlib import circle_area2radius
+from vogeler.extlib import get_field_and_fvs_data_from_src
+
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Functions
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
+def dbh2ht_bh(dbh: float) -> float:
+    """Use allometric equation to estimate tree DBH from its height.
+
+    2025/10/22:
+    The latest equation `DBH = (0.1543646) * (HT ^ 1.071982)` from
+    /mnt/n/RStor/jvogeler/Lab/projects/BH/itd/diameter_height_fia_model/_README.txt
+    is used to predict tree DBH from tree height. Setting DBH to 5 (inches)
+    and solving for HT (tree height in feet) gives 7.816541541647245 meters.
+    The equation is based on FIA Ht and DIA columns (in this
+    context, DBH and DIA are the same thing), and FIA says that DIA units is
+    inches and Ht units is feet (page 3-13 from
+    https://research.fs.usda.gov/understory/forest-inventory-and-analysis-database-user-guide-nfi
+    ).
+    """
+
+    return (dbh / 0.1543646)**(1/1.071982)
+
+
+def print_var(var_name: str) -> None:
+    """Print variable name and its value."""
+
+    print(f"{var_name} = {globals()[var_name]}")
+
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
+# Parse command line input
+fvs_results_path = Path(sys.argv[1])
+
+# Height to DBH threshold for Forest Service BH field plots.
+# DBH collection theshold for Forest Service BH field plots is 5 inches.
+BIG_TREE_DBH_Z_FT = dbh2ht_bh(5)
+BIG_TREE_DBH_Z_METERS = feet2meters(BIG_TREE_DBH_Z_FT)
+print_var("BIG_TREE_DBH_Z_METERS")
+
+# Height to DBH threshold for experimental forest data.
+# DBH collection theshold for Experimental Forest data is 3 inches.
+EFOREST_BIG_TREE_DBH_Z_FT = dbh2ht_bh(3)
+EFOREST_BIG_TREE_DBH_Z_METERS = feet2meters(EFOREST_BIG_TREE_DBH_Z_FT)
+print_var("EFOREST_BIG_TREE_DBH_Z_METERS")
+
+# Experimental Forest data plot radius
+EFOREST_PLOT_RADIUS = feet2meters(
+    circle_area2radius(acre2sqft(0.5))
+)  # Plots are half-acre
+print_var("EFOREST_PLOT_RADIUS")
+
+# ITD/SEG tile buffer
+# Given FVS outputs from FS field data where tree heights were measured, the
+# buffer is the largest_FVS_crown * 2, rounding up to the nearest CHM pixel
+# width
+chm_res = 0.5  # meters
+_, _, fs_trees = get_field_and_fvs_data_from_src(fvs_results_path)
+TAO_PLOT_BUFF = (  # meters
+    max(fs_trees.query('Height_Measurement == "YES"')['CrWidth_m'])
+    * 2 // chm_res * chm_res + chm_res
+)
+print_var("TAO_PLOT_BUFF")
+
+# Max Dalponte crown diameter in 0.5-meter CHM pixels
+# Set equal to the 95th percentile of tree crown diameters from FVS outputs of
+# BH FS field data where tree heights were measured, converted to units of 0.5-
+# meter CHM pixel, rounded down to nearest integer.
+chm_res = 0.5  # meters
+cr_dia_95th = (
+    fs_trees
+    .query('Height_Measurement == "YES"')['CrWidth_m']
+    .quantile(q=0.95)
+)  # 6.56 meters
+DAL_MAX_CR = int(
+    # 1 CHM px = 0.5 m
+    cr_dia_95th * (1 / chm_res)  # CR_DIA meters * (1 px / 0.5 m) = X px
+    # Output is 13.12
+)  # 13 0.5-CHM pixels
+print_var("DAL_MAX_CR")
+
+# Max window diameter for ITD LMF
+Y_CAP = feet2meters(50)
+print_var("Y_CAP")
+
+# Min window diameter for ITD LMF (based on minimum crown diameter found in
+# FVS outputs from BH FS field data where tree heights were measured)
+Y_FLOOR = min(
+    fs_trees
+    .query('Height_Measurement == "YES"')['CrWidth_m']
+)
+print_var("Y_FLOOR")
+
+# Lidar vegetation height delimiter (cut-off), in the point cloud's CRS units,
+# (which is meters for the Black Hills collection). 1.37 meters is
+# equivalent to 4.5 feet (breast height).
+HIGHPASS_DELIM = feet2meters(4.5)
+print_var("HIGHPASS_DELIM")

@@ -1,0 +1,1527 @@
+---
+title: "Black Hills Master Markdown V6"
+author: "Jessie Eastburn"
+date-created: "2025-06-11"
+date-updated: "2025-10-28"
+description: "Last run of 2OD code and for publishing"
+---
+```{r setup, include=F} 
+knitr::opts_chunk$set(warning = F, message = F, eval = F) #, eval = F) # f you do not want to run any code and only knit document, set eval = F
+```
+
+```{r, include=F, eval = T}
+# Read in libraries
+packages <- c(
+  "dplyr",
+  "e1071",
+  "ggplot2",
+  "here",
+  "lidR",
+  "lidRmetrics",
+  "openxlsx",
+  "readr",
+  "readxl",
+  "ranger",
+  "sf",
+  "tmap",
+  "tidyr",
+  "tuneRanger",
+  "terra",
+  "viridis",
+  "VSURF",
+  "writexl"
+)
+
+# Install any missing packages
+installed <- packages %in% rownames(installed.packages())
+if(any(!installed)) {
+  install.packages(packages[!installed])
+}
+
+# Load all packages
+lapply(packages, library, character.only = TRUE)
+```
+
+### Field data pre-processing  
+
+Read in field data, convert to sf object, and transform data into CRS of lidar data 
+```{r, echo = T, eval = FALSE}
+# Read in field data
+field_data = read_excel(here("field_data/fseprd1221357.xlsx"), sheet = 2)
+field_data_filtered = field_data %>% filter(Proportion == 1) # exclude partial plots from dataframe. Partial plots are not being used for modeling as we have no way of determining what portion of the plot was excluded in the field measurements 
+
+# Remove plots that do not overlap with the sampling dataframe
+# Define plots
+plots_to_remove = c(10, 15, 16, 228, 248, 401, 449, 507, 528, 704, 1025, 1080, 1420)
+# Remove the plots
+field_data_filtered = field_data_filtered[!field_data_filtered$Plot %in% plots_to_remove, ]
+
+# Remove plots with NA accuracy
+field_data_filtered = field_data_filtered %>%
+  filter(!is.na(Haccuracy))
+
+# Remove plots with geolocation error higher than 1 meter
+field_data_filtered = field_data_filtered %>%  filter(!(Haccuracy > 1))
+
+# Create sf object of field data in given UTM 4326 coordinates
+field_data_sf = st_as_sf(
+  field_data_filtered,
+  coords = c("Longitude", "Latitude"),
+  crs = 4326,
+  dim = "XY",
+  remove = F)
+
+# Read in any file from 1OD delivery to get the CRS that the field data needs to be transformed into 
+grid_crs = rast("SD_BlackHills_D23_1stReturns_4p5ftPlus_Height_CV_20m.tif")
+
+# Transform coordinates to NAD83 (2011) / UTM zone 13N
+field_data_sf_transformed = st_transform(field_data_sf, crs = st_crs(grid_crs))
+
+# Write sf object to file
+out_dir = here("geometry/points")
+dir.create(out_dir, recursive = T)
+st_write(field_data_sf_transformed, here("geometry/points/field_data_sf_transformed.gpkg"))
+
+# Write transformed df to file
+out_dir = here("geometry/dataframe")
+dir.create(out_dir, recursive = T)
+field_data_df_transformed = st_drop_geometry(field_data_sf_transformed)
+field_data_df_transformed = as.data.frame(field_data_df_transformed)
+write_xlsx(field_data_df_transformed, here("geometry/dataframe/field_data_df_transformed.xlsx"))
+```
+
+```{r}
+# Read back in files
+field_data_sf_transformed = st_read(here("geometry/points/field_data_sf_transformed.gpkg"))
+field_data_df_transformed = read_excel(here("geometry/dataframe/field_data_df_transformed.xlsx"))
+```
+
+Buffer the transformed coordinates to the radius of plot polygons (11.33856 meters) to get plot geometry.
+```{r, eval = FALSE}
+field_data_utm_poly = st_buffer(field_data_sf_transformed, dist = 11.33856) # buffer field data based on plot center coordinates to fixed radius of 11.33856 meters
+
+# Write polygon geometry
+out_dir = here("geometry/polygons")
+dir.create(out_dir, recursive = T)
+st_write(field_data_utm_poly, here("geometry/polygons/field_data_utm_poly_11.gpkg"))
+```
+
+Read back in polygon geometry
+```{r}
+field_data_utm_poly = st_read(here("geometry/polygons/field_data_utm_poly_11.gpkg"))
+```
+
+Buffer the transformed coordinates to 21 meters to include a 10m processing buffer.
+```{r, eval = FALSE}
+field_data_utm_poly_21 = st_buffer(field_data_sf_transformed, dist = 21) # buffer field data based on plot center coordinates to 21 meter radius to provide a processing buffer and avoid potential edge artifacts
+
+# Write and read back in polygon geometry
+out_dir = here("geometry/polygons")
+st_write(field_data_utm_poly_21, here("geometry/polygons/field_data_utm_poly_21.gpkg"))
+field_data_utm_poly_21 = st_read(here("geometry/polygons/field_data_utm_poly_21.gpkg"))
+```
+
+### Lidar Pre-Processing
+Processing lidar point cloud plots for cloud metric calculation  
+
+Get path to lidar catalog and read in data
+```{r, eval = FALSE}
+ctg_pth = "D:/syncthing2/SD_BlackHills_D23/PointClouds"
+ctg_pth_files = list.files(ctg_pth, pattern = "\\.laz$", full.names = T)
+ctg =  readLAScatalog(ctg_pth_files, filter = "-drop_class 7 18 -drop_withheld") # drop noise classes identified by vendor 
+```
+
+Clip plots from lidar point cloud data to 20m for further processing
+```{r, eval = FALSE}
+# Clip lidar catalog to 21m  geometry
+rois = clip_roi(ctg, field_data_utm_poly_21) 
+
+# Set output directory
+out_dir = here("clip_plots/plots_21m_1")
+dir.create(out_dir, recursive = T)
+
+# Filter out any empty LAS objects. Should be 0
+non_empty_indices = which(sapply(rois, function(x) !lidR::is.empty(x))) # empty las objects 
+non_empty_rois = rois[non_empty_indices]  # get plots that are not empty 
+plot_ids = field_data_utm_poly_21$Plot[non_empty_indices] # get id of each plot for naming output clipped plot file
+
+# Write clipped plot to file
+for (i in seq_along(non_empty_rois)) {
+  las = non_empty_rois[[i]]
+  plot_id = plot_ids[i] 
+  file_path = file.path(out_dir, paste0("plot", plot_id, ".las")) 
+  writeLAS(las, file_path)}
+```
+
+Read in virtual DTM for height normalization of point clouds
+```{r, eval = FALSE}
+# Read in DTM for height normalizing
+dtm_file = "D:/syncthing2/SD_BlackHills_D23/Mosaics/DigitalTerrainModel/DTM_full_new.vrt"
+dtm = rast(dtm_file)
+```
+
+Point cloud filtering and normalization
+```{r, eval = FALSE}
+# Read in 20m clipped plots 
+ctg_pth = here("clip_plots/plots_21m_1/")
+ctg = readLAScatalog(ctg_pth)
+
+# Set output directory
+out_dir = here("clip_plots/plots_21m_nodup_norm_filt_2")
+dir.create(out_dir, recursive = T)
+
+# Apply point cloud filtering and normalization and save LAS files of plots
+lidR::catalog_apply(ctg, function(plot) { # code adapted from Daniel Rhode
+
+  # Read the LAS file for the plot
+  las = lidR::readLAS(plot)
+  if (lidR::is.empty(las)) return(NULL) # check if las file is empty (shouldn't be)
+  
+  # Filter and normalize plots
+  las_class = filter_poi(las, Classification != c(102, 106, 115)) # # drop noise classes created by Daniel to identify rocks, power infrastructure, and buildings (102, 106, and 115)
+  las_nodups = lidR::filter_duplicates(las_class) # remove duplicated points
+  las_norm = normalize_height(las_nodups, dtm) # normalize height using vendor corrected DTM
+  las_filtered = filter_poi(las_norm, Z >= -0.1 & Z <= 50) # remove points below 10cm and above 50m. -10cm is the lidar vertical accuracy error and points above 50m are identified as high noise.
+  
+  # Check if normalization resulted in an empty LAS object
+  if (lidR::is.empty(las_filtered)) {
+    message("LAS is empty after normalization, skipping write.")
+    return(NULL)}
+  
+  # Create output file 
+  output_file = file.path(out_dir, paste0(tools::file_path_sans_ext(basename(plot@files)), ".las"))
+
+  # Write the post-processed clip plots to LAS files
+  lidR::writeLAS(las_filtered, output_file)})
+```
+
+Clip post-processed 21m point clouds to actual 11.33856 plot dimensions
+```{r, eval = FALSE}
+# Read back in processed lidar point clouds
+ctg_pth = here("clip_plots/plots_21m_nodup_norm_filt_2/")
+ctg =  readLAScatalog(ctg_pth) 
+
+# Clip 20m plots to actual plot size
+rois = clip_roi(ctg, field_data_utm_poly) # Use polygons buffered to the actual plot dimensions
+
+# Set output directory
+out_dir = here("clip_plots/plots_11m_3")
+dir.create(out_dir, recursive = T)
+
+# Filter out any empty LAS objects. Should be 0
+non_empty_indices = which(sapply(rois, function(x) !lidR::is.empty(x))) # empty las objects 
+non_empty_rois = rois[non_empty_indices]  # get plots that are not empty 
+plot_ids = field_data_utm_poly$Plot[non_empty_indices] # get Plot IDs for LAS file names
+
+# Write plots to LAS files
+for (i in seq_along(non_empty_rois)) {
+  las = rois[[i]]
+  plot_id = plot_ids[i]
+  file_path = file.path(out_dir, paste0("plot", plot_id, ".las"))
+  writeLAS(las, file_path)}
+```
+
+### Cloudmetrics 
+Define and apply functions for calculating cloudmetrics for each plot
+
+Calculate strata metrics 
+```{r}
+# Read in 20m clip plot catalog and 11m plot geometry 
+processed_las = readLAScatalog(here("clip_plots/plots_21m_nodup_norm_filt_2")) # use processed 21m clipped plots for cloud metric calculation, clipping to actual plot geometry done using plot_metrics() function at end of code block 
+field_data_utm_poly = st_read(here("geometry/polygons/field_data_utm_poly_11.gpkg"))
+
+field_data_utm_poly_plot = subset(field_data_utm_poly, select = c(Plot)) # subset to only plot number to exclude other unnecessary fields
+
+# Read in any file from lidar catalog to get the CRS that the field data needs to be transformed into. Operation necessary for the plot_metrics() function to run. 
+lidar_crs =  readLAS(here("clip_plots/plots_21m_nodup_norm_filt_2/plot998.las")) 
+
+# Transform coordinates to lidar crs: NAD83 (2011) / UTM zone 13N with NAVD88 height
+field_data_utm_poly_plot_t = st_transform(field_data_utm_poly_plot, crs = st_crs(lidar_crs))
+
+# Write polygon geometry with lidar crs
+out_dir = here("geometry/polygons/lidar_crs")
+dir.create(out_dir, recursive = T)
+st_write(field_data_utm_poly_plot_t, here("geometry/polygons/lidar_crs/field_data_utm_poly_11_lidar_crs.gpkg"))
+
+field_data_utm_poly_plot_t = st_read(here("geometry/polygons/lidar_crs/field_data_utm_poly_11_lidar_crs.gpkg"))
+```
+
+```{r}
+# Code adapted from Daniel Rhode
+
+m2ft = function(num) { # convert meters to feet to match 1OD
+  return(num/0.3048)}
+
+HIGHPASS_DELIM = 4.5  # LiDAR vegetation height delimiter (cut-off) of 4.5 ft (breast_height)
+GROUND = -0.3281  # 10 cm RMSEz Vertical Accuracy Class converted to feet
+CIRCLE_AREA = pi * (m2ft(11.33856))^2 # area of plot in feet
+
+get_strat_cloud = function(las, total_count) {
+  if (lidR::is.empty(las)) {
+    return(NA)}
+  return(lidR::npoints(las) / total_count)}
+
+get_cloud_metrics = function(las) {
+  if (lidR::is.empty(las)) {
+    return(NULL)}
+  
+  # Convert lidar data to feet to match gridmetrics 
+  las@data$Z = m2ft(las@data$Z)
+
+  # Define lidar point counts to use in strata metrics
+  total_count = lidR::npoints(las) # total number of points in the plot from -10cm to 50m
+  las_frst = lidR::filter_first(las) # filter data to first returns
+  frst_count = lidR::npoints(las_frst) # number of first returns
+
+  # Define strata metrics from ground to 170 ft
+  strata_metrics = list(
+    "SD_BlackHills_D23_AllReturns_Strata_0to0p5ft_20m" = get_strat_cloud(
+      lidR::filter_poi(las, Z >= GROUND  & Z < (0.5)), total_count),
+    "SD_BlackHills_D23_AllReturns_Strata_0p5to1ft_20m" = get_strat_cloud(
+      lidR::filter_poi(las, Z >= (0.5) & Z < (1)), total_count),
+    "SD_BlackHills_D23_AllReturns_Strata_1to4p5ft_20m" = get_strat_cloud(
+      lidR::filter_poi(las, Z >= (1)   & Z < (4.5)), total_count),
+    "SD_BlackHills_D23_AllReturns_Strata_4p5to10ft_20m" = get_strat_cloud(
+      lidR::filter_poi(las, Z >= (4.5) & Z < (10)), total_count),
+    "SD_BlackHills_D23_AllReturns_Strata_10to20ft_20m" = get_strat_cloud(
+      lidR::filter_poi(las, Z >= (10)  & Z < (20)), total_count),
+    "SD_BlackHills_D23_AllReturns_Strata_20to30ft_20m" = get_strat_cloud(
+      lidR::filter_poi(las, Z >= (20)  & Z < (30)), total_count),
+    "SD_BlackHills_D23_AllReturns_Strata_30to40ft_20m" = get_strat_cloud(
+      lidR::filter_poi(las, Z >= (30)  & Z < (40)), total_count),
+    "SD_BlackHills_D23_AllReturns_Strata_40to50ft_20m" = get_strat_cloud(
+      lidR::filter_poi(las, Z >= (40)  & Z < (50)), total_count),
+    "SD_BlackHills_D23_AllReturns_Strata_50to60ft_20m" = get_strat_cloud(
+      lidR::filter_poi(las, Z >= (50)  & Z < (60)), total_count),
+    "SD_BlackHills_D23_AllReturns_Strata_60to70ft_20m" = get_strat_cloud(
+      lidR::filter_poi(las, Z >= (60)  & Z < (70)), total_count),
+    "SD_BlackHills_D23_AllReturns_Strata_70to80ft_20m" = get_strat_cloud(
+      lidR::filter_poi(las, Z >= (70)  & Z < (80)), total_count),
+    "SD_BlackHills_D23_AllReturns_Strata_80to90ft_20m" = get_strat_cloud(
+      lidR::filter_poi(las, Z >= (80)  & Z < (90)), total_count),
+    "SD_BlackHills_D23_AllReturns_Strata_90to100ft_20m" = get_strat_cloud(
+      lidR::filter_poi(las, Z >= (90)  & Z < (100)), total_count),
+    "SD_BlackHills_D23_AllReturns_Strata_100to110ft_20m" = get_strat_cloud(
+      lidR::filter_poi(las, Z >= (100) & Z < (110)), total_count),
+    "SD_BlackHills_D23_AllReturns_Strata_110to120ft_20m" = get_strat_cloud(
+      lidR::filter_poi(las, Z >= (110) & Z < (120)), total_count),
+    "SD_BlackHills_D23_AllReturns_Strata_120to130ft_20m" = get_strat_cloud(
+      lidR::filter_poi(las, Z >= (120) & Z < (130)), total_count),
+    "SD_BlackHills_D23_AllReturns_Strata_130to140ft_20m" = get_strat_cloud(
+      lidR::filter_poi(las, Z >= (130) & Z < (140)), total_count),
+    "SD_BlackHills_D23_AllReturns_Strata_140to150ft_20m" = get_strat_cloud(
+      lidR::filter_poi(las, Z >= (140) & Z < (150)), total_count),
+    "SD_BlackHills_D23_AllReturns_Strata_150to160ft_20m" = get_strat_cloud(
+      lidR::filter_poi(las, Z >= (150) & Z < (160)), total_count),
+    "SD_BlackHills_D23_AllReturns_Strata_160to170ft_20m" = get_strat_cloud(
+      lidR::filter_poi(las, Z >= (160) & Z < (170)), total_count))
+
+  strata_metrics_frst = list(
+    "SD_BlackHills_D23_1stReturns_Strata_0to0p5ft_20m" = get_strat_cloud(
+      lidR::filter_poi(las_frst, Z >= GROUND  & Z < (0.5)), frst_count),
+    "SD_BlackHills_D23_1stReturns_Strata_0p5to1ft_20m" = get_strat_cloud(
+      lidR::filter_poi(las_frst, Z >= (0.5) & Z < (1)), frst_count),
+    "SD_BlackHills_D23_1stReturns_Strata_1to4p5ft_20m" = get_strat_cloud(
+      lidR::filter_poi(las_frst, Z >= (1)   & Z < (4.5)), frst_count),
+    "SD_BlackHills_D23_1stReturns_Strata_4p5to10ft_20m" = get_strat_cloud(
+      lidR::filter_poi(las_frst, Z >= (4.5) & Z < (10)), frst_count),
+    "SD_BlackHills_D23_1stReturns_Strata_10to20ft_20m" = get_strat_cloud(
+      lidR::filter_poi(las_frst, Z >= (10)  & Z < (20)), frst_count),
+    "SD_BlackHills_D23_1stReturns_Strata_20to30ft_20m" = get_strat_cloud(
+      lidR::filter_poi(las_frst, Z >= (20)  & Z < (30)), frst_count),
+    "SD_BlackHills_D23_1stReturns_Strata_30to40ft_20m" = get_strat_cloud(
+      lidR::filter_poi(las_frst, Z >= (30)  & Z < (40)), frst_count),
+    "SD_BlackHills_D23_1stReturns_Strata_40to50ft_20m" = get_strat_cloud(
+      lidR::filter_poi(las_frst, Z >= (40)  & Z < (50)), frst_count),
+    "SD_BlackHills_D23_1stReturns_Strata_50to60ft_20m" = get_strat_cloud(
+      lidR::filter_poi(las_frst, Z >= (50)  & Z < (60)), frst_count),
+    "SD_BlackHills_D23_1stReturns_Strata_60to70ft_20m" = get_strat_cloud(
+      lidR::filter_poi(las_frst, Z >= (60)  & Z < (70)), frst_count),
+    "SD_BlackHills_D23_1stReturns_Strata_70to80ft_20m" = get_strat_cloud(
+      lidR::filter_poi(las_frst, Z >= (70)  & Z < (80)), frst_count),
+    "SD_BlackHills_D23_1stReturns_Strata_80to90ft_20m" = get_strat_cloud(
+      lidR::filter_poi(las_frst, Z >= (80)  & Z < (90)), frst_count),
+    "SD_BlackHills_D23_1stReturns_Strata_90to100ft_20m" = get_strat_cloud(
+      lidR::filter_poi(las_frst, Z >= (90)  & Z < (100)), frst_count),
+    "SD_BlackHills_D23_1stReturns_Strata_100to110ft_20m" = get_strat_cloud(
+      lidR::filter_poi(las_frst, Z >= (100) & Z < (110)), frst_count),
+    "SD_BlackHills_D23_1stReturns_Strata_110to120ft_20m" = get_strat_cloud(
+      lidR::filter_poi(las_frst, Z >= (110) & Z < (120)), frst_count),
+    "SD_BlackHills_D23_1stReturns_Strata_120to130ft_20m" = get_strat_cloud(
+      lidR::filter_poi(las_frst, Z >= (120) & Z < (130)), frst_count),
+    "SD_BlackHills_D23_1stReturns_Strata_130to140ft_20m" = get_strat_cloud(
+      lidR::filter_poi(las_frst, Z >= (130) & Z < (140)), frst_count),
+    "SD_BlackHills_D23_1stReturns_Strata_140to150ft_20m" = get_strat_cloud(
+      lidR::filter_poi(las_frst, Z >= (140) & Z < (150)), frst_count),
+    "SD_BlackHills_D23_1stReturns_Strata_150to160ft_20m" = get_strat_cloud(
+      lidR::filter_poi(las_frst, Z >= (150) & Z < (160)), frst_count),
+    "SD_BlackHills_D23_1stReturns_Strata_160to170ft_20m" = get_strat_cloud(
+      lidR::filter_poi(las_frst, Z >= (160) & Z < (170)), frst_count))
+  return(c(strata_metrics, strata_metrics_frst))
+  }
+
+# Apply strata_metrics function using plot_metrics()
+strat_metrics = lidR::plot_metrics(
+  processed_las, # post-processed las catalog of plots
+  func = ~get_cloud_metrics(las),
+  geometry = field_data_utm_poly_plot_t) # use crs transformed 11m plot geometry
+```
+
+Calculate additional cloud metrics using [lidRmetrics](https://github.com/ptompalski/lidRmetrics) package.
+```{r}
+addl_metrics = function(las) {
+  
+  # #convert meters to feet to match 1OD
+  las@data$Z = m2ft(las@data$Z)
+
+  # Get filtered datasets
+  las_frst = lidR::filter_first(las) # first returns
+  las_all_hp = lidR::filter_poi(las, Z >= HIGHPASS_DELIM) # all returns above 4.5 ft
+  las_frst_hp = lidR::filter_poi(las_frst, Z >= HIGHPASS_DELIM) # first returns above 4.5 ft
+  
+  # Get total counts
+  all_count = lidR::npoints(las) # count of all returns
+  frst_count = lidR::npoints(las_frst) # count of first returns
+  hp_count = lidR::npoints(las_all_hp) # count of returns above high-pass 
+  frsthp_count = lidR::npoints(las_frst_hp) # count of first returns above high-pass 
+  
+  # Compute density and canopy metrics
+  density_metrics = data.frame(
+    SD_BlackHills_D23_PulseDensity_20m = ifelse(frst_count > 0, frst_count / CIRCLE_AREA, NA), # pulse density of each plot
+    SD_BlackHills_D23_PointDensity_20m = ifelse(all_count > 0, all_count /  CIRCLE_AREA, NA), # point density of each plot
+    SD_BlackHills_D23_CanopyCover_20m = ifelse(frst_count > 0, frsthp_count / frst_count, NA), # canopy cover of each plot
+    SD_BlackHills_D23_CanopyDensity_20m = ifelse(all_count > 0, hp_count / all_count, NA)) # canopy density of each plot
+  
+  # Compute rumple metrics
+  rumple_metric = data.frame(
+    SD_BlackHills_D23_AllReturns_Rumple_20m = lidRmetrics::metrics_rumple(las$X, las$Y, las$Z, pixel_size = 1))
+  
+  # Function to compute L-moments with prefixes to match grid metrics naming scheme
+  compute_Lmoments = function(las, prefix = "", zmin = HIGHPASS_DELIM) {
+    lmoments = lidRmetrics::metrics_Lmoments(las$Z, zmin = zmin)
+    lmoments_df = as.data.frame(lmoments)
+    colnames(lmoments_df) = paste0(prefix, colnames(lmoments_df))
+    return(lmoments_df)
+  }
+  # Apply function to calculate L-moments 
+  all_Lmoments = compute_Lmoments(las, prefix = "SD_BlackHills_D23_AllReturns_Lmoment_", zmin = HIGHPASS_DELIM)
+  frst_Lmoments = compute_Lmoments(las_frst, prefix = "SD_BlackHills_D23_1stReturns_Lmoment_", zmin = HIGHPASS_DELIM)
+  all_hp_Lmoments = compute_Lmoments(las_all_hp, prefix = "SD_BlackHills_D23_AllReturns_4p5ftPlus_Lmoment_", zmin = HIGHPASS_DELIM)
+  frst_hp_Lmoments = compute_Lmoments(las_frst_hp, prefix = "SD_BlackHills_D23_1stReturns_4p5ftPlus_Lmoment_", zmin = HIGHPASS_DELIM)
+
+  # Bind L-moments together
+  Lmoments = cbind(all_Lmoments, frst_Lmoments, all_hp_Lmoments, frst_hp_Lmoments)
+
+  # Edit column names of L-moments to match gridmetrics
+  colnames(Lmoments) = paste0(
+    gsub("Lskew", "Skew",
+    gsub("Lkurt", "Kurt",
+    gsub("Lcoefvar", "CV",
+    gsub("L4", "4", 
+    gsub("L3", "3", 
+    gsub("L2", "2", 
+    gsub("L1", "1", 
+    colnames(Lmoments)))))))), "_20m")
+
+  # Define function for KDE
+  compute_kde = function(las, prefix = "", zmin = HIGHPASS_DELIM, bw = 4, npeaks = 4) {
+    kde = lidRmetrics::metrics_kde(las$Z, zmin = zmin, bw = bw, npeaks = npeaks)
+    kde_df = as.data.frame(kde)
+    colnames(kde_df) = paste0(prefix, colnames(kde_df))
+    return(kde_df)
+  }
+  # Apply function to calculate KDE
+  all_KDE     = compute_kde(las, prefix = "SD_BlackHills_D23_AllReturns_", zmin = HIGHPASS_DELIM)
+  frst_KDE    = compute_kde(las_frst, prefix = "SD_BlackHills_D23_1stReturns_", zmin = HIGHPASS_DELIM)
+  all_hp_KDE  = compute_kde(las_all_hp, prefix = "SD_BlackHills_D23_AllReturns_4p5ftPlus_", zmin = HIGHPASS_DELIM)
+  frst_hp_KDE = compute_kde(las_frst_hp, prefix = "SD_BlackHills_D23_1stReturns_4p5ftPlus_", zmin = HIGHPASS_DELIM)
+
+  # Bind KDE together
+  KDE = cbind(all_KDE, frst_KDE, all_hp_KDE, frst_hp_KDE)
+
+  # Edit column names of KDE to match gridmetrics
+  colnames(KDE) = paste0(
+    gsub("kde_peak1", "KDE_Peak1",
+    gsub("kde_peak2", "KDE_Peak2",
+    gsub("kde_peak3", "KDE_Peak3",
+    gsub("kde_peak4", "KDE_Peak4", 
+    gsub("kde_peaks", "KDE_Peaks", 
+    gsub("elev", "Elev", 
+    gsub("count", "Count", 
+    gsub("value", "Value", 
+    gsub("diff", "Diff", 
+    colnames(KDE)))))))))), "_20m")
+  
+  # Compute allreturn high-pass metrics
+  hp_metrics = data.frame(
+    SD_BlackHills_D23_AllReturns_4p5ftPlus_Height_Mean_20m = mean(las_all_hp$Z, na.rm = T), # mean height
+    SD_BlackHills_D23_AllReturns_4p5ftPlus_Height_Stddev_20m = sd(las_all_hp$Z, na.rm = T), # standard deviation of height
+    SD_BlackHills_D23_AllReturns_4p5ftPlus_Height_CV_20m = sd(las_all_hp$Z, na.rm = T) / mean(las_all_hp$Z, na.rm = T), # coefficient of variation
+    SD_BlackHills_D23_AllReturns_4p5ftPlus_Height_Min_20m = min(las_all_hp$Z, na.rm = T), # minimum height
+    SD_BlackHills_D23_AllReturns_4p5ftPlus_Height_Max_20m = max(las_all_hp$Z, na.rm = T), # max height
+    SD_BlackHills_D23_AllReturns_4p5ftPlus_Height_Skew_20m = e1071::skewness(las_all_hp$Z, na.rm = T), # skewness of height
+    SD_BlackHills_D23_AllReturns_4p5ftPlus_Height_Kurt_20m = e1071::kurtosis(las_all_hp$Z, na.rm = T)) # kurtosis of height
+  
+  # Compute high-pass first metrics
+  hp_frst_metrics = data.frame(
+    SD_BlackHills_D23_1stReturns_4p5ftPlus_Height_Mean_20m = mean(las_frst_hp$Z, na.rm = T), # mean height
+    SD_BlackHills_D23_1stReturns_4p5ftPlus_Height_Stddev_20m = sd(las_frst_hp$Z, na.rm = T), # standard deviation of height
+    SD_BlackHills_D23_1stReturns_4p5ftPlus_Height_CV_20m = sd(las_frst_hp$Z, na.rm = T) / mean(las_frst_hp$Z, na.rm = T), # coefficient of variation
+    SD_BlackHills_D23_1stReturns_4p5ftPlus_Height_Min_20m = min(las_frst_hp$Z, na.rm = T), # minimum height
+    SD_BlackHills_D23_1stReturns_4p5ftPlus_Height_Max_20m = max(las_frst_hp$Z, na.rm = T), # max height
+    SD_BlackHills_D23_1stReturns_4p5ftPlus_Height_Skew_20m = e1071::skewness(las_frst_hp$Z, na.rm = T), # skewness of height
+    SD_BlackHills_D23_1stReturns_4p5ftPlus_Height_Kurt_20m = e1071::kurtosis(las_frst_hp$Z, na.rm = T)) # kurtosis of height
+  
+  # Compute height percentiles for all returns above high-pass
+  probs = c(0.01, 0.02, 0.05, 0.1, 0.2, 0.25, 0.3, 0.4, 0.5, 0.6, 0.7, 0.75, 0.8, 0.9, 0.95, 0.98, 0.99) # define percentiles
+  # Calculate percentiles using points above high-pass filter
+  z_percentiles_hp = quantile(las_all_hp@data$Z, probs = probs, na.rm = T) 
+  # Convert percentiles to dataframe
+  percentiles_hp_df = as.data.frame(t(z_percentiles_hp)) 
+  # Clean percentile names to match grid_metrics naming scheme
+  clean_names = paste0(probs * 100)  
+  # Add prefix to match grid_metrics naming scheme
+  colnames(percentiles_hp_df) = paste0("SD_BlackHills_D23_AllReturns_4p5ftPlus_Height_P", clean_names, "_20m") 
+  
+  # Calculate height percentiles for 1st returns hp
+  z_percentiles_first_hp = quantile(las_frst_hp@data$Z, probs = probs, na.rm = T)
+  # Convert percentiles to dataframe
+  percentiles_first_hp_df = as.data.frame(t(z_percentiles_first_hp)) 
+  # Clean percentile names to match grid_metrics naming scheme
+  clean_names = paste0(probs * 100) 
+  # Add prefix to match grid_metrics naming scheme
+  colnames(percentiles_first_hp_df) = paste0("SD_BlackHills_D23_1stReturns_4p5ftPlus_Height_P", clean_names, "_20m") 
+
+  # Bind all results 
+  metrics_df = cbind(
+    density_metrics, 
+    rumple_metric,
+    Lmoments,
+    KDE,
+    hp_metrics, 
+    hp_frst_metrics,
+    percentiles_hp_df,
+    percentiles_first_hp_df)
+  
+  return(metrics_df)}
+
+# Apply function using plot_metrics()
+additional_metrics = plot_metrics(
+  processed_las, 
+  func = ~addl_metrics(las),
+  geometry = field_data_utm_poly_plot_t) 
+
+# Fix issues with column names that do not match grid_metrics
+names(additional_metrics)[names(additional_metrics) == "rumple"] = "SD_BlackHills_D23_AllReturns_Rumple_20m"
+
+names(additional_metrics)[names(additional_metrics) == "SD_BlackHills_D23_1stReturns_4p5ftPlus_Height_P1_20m"] = "SD_BlackHills_D23_1stReturns_4p5ftPlus_Height_P01_20m"
+
+names(additional_metrics)[names(additional_metrics) == "SD_BlackHills_D23_1stReturns_4p5ftPlus_Height_P2_20m"] = "SD_BlackHills_D23_1stReturns_4p5ftPlus_Height_P02_20m"
+
+names(additional_metrics)[names(additional_metrics) == "SD_BlackHills_D23_1stReturns_4p5ftPlus_Height_P5_20m"] = "SD_BlackHills_D23_1stReturns_4p5ftPlus_Height_P05_20m"
+
+names(additional_metrics)[names(additional_metrics) == "SD_BlackHills_D23_AllReturns_4p5ftPlus_Height_P1_20m"] = "SD_BlackHills_D23_AllReturns_4p5ftPlus_Height_P01_20m"
+
+names(additional_metrics)[names(additional_metrics) == "SD_BlackHills_D23_AllReturns_4p5ftPlus_Height_P2_20m"] = "SD_BlackHills_D23_AllReturns_4p5ftPlus_Height_P02_20m"
+
+names(additional_metrics)[names(additional_metrics) == "SD_BlackHills_D23_AllReturns_4p5ftPlus_Height_P5_20m"] = "SD_BlackHills_D23_AllReturns_4p5ftPlus_Height_P05_20m"
+```
+
+Merge cloud metric outputs, clean up dataframe, and output all cloud metrics to a dataframe
+```{r}
+# Set output directory
+out_dir = here("cloud_metrics/rev_102025")
+dir.create(out_dir, recursive = T)
+
+# Convert SF objects to data frames
+strat_metrics_df = as.data.frame(strat_metrics)
+additional_metrics_df = as.data.frame(additional_metrics)
+
+# Write intermediate cloudmetric outputs to excel
+write_xlsx(strat_metrics_df, here("cloud_metrics/rev_102025/strat_metrics_df.xlsx"))
+write_xlsx(additional_metrics_df, here("cloud_metrics/rev_102025/additional_metrics_df.xlsx"))
+
+# Merge the data frames
+merged_df = strat_metrics_df %>% left_join(additional_metrics_df, by = "Plot")  # Only keep one Plot column when joining to avoid duplicated columns
+
+# Clean up dataframe by removing extra geometry columns and setting Inf and NAN values to NA
+merged_df = merged_df %>% select(-geom.y) # remove extra geometry column
+merged_df = merged_df %>% select(-geom.x) # remove extra geometry column
+merged_df[sapply(merged_df, is.infinite)] = NA # set any Inf values to NA
+merged_df[sapply(merged_df, is.nan)] = NA # set any Nan values to NA
+
+# Write cloudmetrics to excel
+write_xlsx(merged_df, here("cloud_metrics/rev_102025/cloud_metrics.xlsx"))
+
+# Read back in
+cloud_metrics = read_excel(here("cloud_metrics/rev_102025/cloud_metrics.xlsx"))
+```
+
+### Gridmetrics 
+Load and combine grid metrics and strata metrics to single raster stack for later use in prediction
+
+```{r}
+# Read in grid metrics 
+gridmetrics_files = list.files("N:/RStor/jvogeler/Lab/projects/BH/final_deliverables/1OD_Oct25_redelivery/SD_BlackHills_D23/GridMetrics/Metrics_20Meters/", pattern = "\\.tif$", full.names = T) # gridmetrics deliverable
+gridmetrics = terra::rast(gridmetrics_files) 
+
+# Read in strata metrics
+strat_files = list.files("N:/RStor/jvogeler/Lab/projects/BH/final_deliverables/1OD_Oct25_redelivery/SD_BlackHills_D23/GridMetrics/StrataMetrics_20Meters/", pattern = "\\.tif$", full.names = T)
+strat = terra::rast(strat_files) # Load selected files
+
+# Combine raster stacks
+grid_stack = c(strat, gridmetrics)
+
+# Set output directory
+output_dir = here("grid_metrics/rev_102025")
+dir.create(output_dir, recursive = T)
+
+# Write gridmetrics to raster stack
+writeRaster(grid_stack, here("grid_metrics/rev_102025/grid_metrics_stack.tif"), overwrite = T)
+
+# Read back in gridmetrics raster stack
+grid_stack =  rast(here("grid_metrics/rev_102025/grid_metrics_stack.tif"))
+```
+
+### Climate Metrics
+Read climate metrics stack and extract values for each plot to use as potential predictor variables
+
+```{r}
+# Read climate_stack
+climate_stack_files = list.files("N:/RStor/jvogeler/Lab/projects/BH/ancillary_data/climate_metrics/", pattern = "\\.tif$", full.names = T)
+climate_stack = rast(climate_stack_files)
+
+# Fix extent and crop
+climate_stack_cropped = crop(climate_stack, ext(grid_stack[[1]])) # crop climate_stack to match the extent of grid_metrics
+climate_stack_cropped = project(climate_stack_cropped, crs(grid_stack[[1]])) # transform coordinates to NAD83 (2011) / UTM zone 13N
+
+# Read in 11m plot geometry to extract weighted mean climate values for each plot
+field_data_utm_poly = st_read(here("geometry/polygons/field_data_utm_poly_11.gpkg"))
+field_data_utm_poly_plot = subset(field_data_utm_poly, select = c(Plot)) # subset to only plot number and geometry to exclude unnecessary fields in output
+
+# Extract weighted mean raster values within each plot 
+climate_values = terra::extract(climate_stack_cropped, field_data_utm_poly_plot, fun = mean, na.rm = T, weights = T, ID = F) # uses mean of pixels intersecting plot geometry to calculate climate value for each plot
+
+# Add plot column to output climate values
+climate_values_with_plot = bind_cols(climate_values, field_data_utm_poly %>% select(Plot))
+
+# Create subset of climate metrics that is only the annuals by excluding seasonal and monthly variables
+pattern = "(_at|_sm|_sp|_wt)" # define pattern to get metrics containing seasonal labels (autumn, summer, spring, winter) 
+matching_columns = grep(pattern, names(climate_values_with_plot), value = T) # get columns matching the pattern
+climate_metrics_cleaned = climate_values_with_plot[, !names(climate_values_with_plot) %in% matching_columns] # remove columns matching the pattern
+pattern = "(01|02|03|04|05|06|07|08|09|10|11|12)" # define pattern to get metrics containing month labels 
+matching_columns = grep(pattern, names(climate_metrics_cleaned), value = T) # get columns matching the pattern
+climate_metrics_cleaned2 = climate_metrics_cleaned[, !names(climate_metrics_cleaned) %in% matching_columns] # remove columns matching the pattern
+
+# Remove empty MAR column
+climate_metrics_cleaned2 = climate_metrics_cleaned2 %>% select(-MAR)
+
+# Set output directory
+output_dir = here("climate_metrics/rev_102025")
+dir.create(output_dir, recursive = T)
+
+# Write to climate metric annual values to excel
+write_xlsx(climate_metrics_cleaned2, here("climate_metrics/rev_102025/climate_metrics_annuals.xlsx"))
+
+# Read back in climate metrics
+climate_metrics = read_excel(here("climate_metrics/rev_102025/climate_metrics_annuals.xlsx"))
+
+# Create raster stack of climate annuals 
+climate_stack_annuals = climate_stack_cropped[[names(climate_stack_cropped) %in% colnames(climate_metrics)]] # Subset the climate raster stack to only the annual climate metrics
+
+# Write to stack to be used as predictors
+writeRaster(climate_stack_annuals, here("climate_metrics/rev_102025/climate_metrics_stack_annuals.tif"), overwrite = T)
+
+# Read back in climate stack
+climate_stack = rast(here("climate_metrics/rev_102025/climate_metrics_stack_annuals.tif"))
+```
+
+### Topometrics
+See "BH_Topometrics_041625_deliverable.R" for code to aggregate dtm to 20m and calculate topometrics. 
+
+Extract topometrics for each plot from topometrics raster stack 
+```{r}
+# Read back in fixed extent files 
+topometrics_files = list.files("N:/RStor/jvogeler/Lab/projects/BH/final_deliverables/1OD_Oct25_redelivery/SD_BlackHills_D23/Mosaics/TopoMetrics_20meters/", pattern = "\\.tif$", full.names = T)
+
+# Create raster stack
+topometrics_stack = rast(topometrics_files)
+
+# Set output directory
+output_dir = here("topo_metrics/rev_102025")
+dir.create(output_dir, recursive = T)
+
+# Write raster stack to file for prediction
+writeRaster(topometrics_stack, here("topo_metrics/rev_102025/topo_metrics_stack.tif"), overwrite = T)
+
+# Read back in topometrics stack 
+topometrics_stack = rast("topo_metrics/rev_102025/topo_metrics_stack.tif")
+
+# Extract weighted mean topometrics values within each plot
+topometrics_values = terra::extract(topometrics_stack, field_data_utm_poly_plot, fun = mean, na.rm = T, weights = T, ID = F)
+
+# Add plot number to output topometrics values
+topometrics_values_with_plot = bind_cols(topometrics_values, field_data_utm_poly_plot %>% dplyr::select(Plot))
+
+# Write to excel
+write_xlsx(topometrics_values_with_plot, here("topo_metrics/rev_102025/topo_metrics.xlsx"))
+
+# Read back in topometrics
+topometrics = read_excel(here("topo_metrics/rev_102025/topo_metrics.xlsx"))
+```
+
+### Response Variables
+Retrieve response variables from Forest Vegetation Simulator (FVS)
+
+Get AGB for each plot from FVS output table
+```{r}
+# Create Directory to store response variable dataframes
+out_dir = here("response_variables/rev_102025")
+dir.create(out_dir, recursive = T)
+
+# Get AGB from FVS_Carbon table
+agb1 = read_excel(here("fvs/output/Run_1_FVSoutput_1220_plots.xlsx"), sheet = "FVS_Carbon")
+agb = subset(agb1, select = c("StandID","Aboveground_Total_Live")) # subset table to only StandID (Plot) and Aboveground_Total_Live (AGB) columns 
+agb = agb %>% rename(Plot = StandID) # rename StandID to Plot to match naming scheme
+agb = agb %>% rename(Carbon = Aboveground_Total_Live) # rename Aboveground_Total_Live to Carbon 
+agb$AGB = agb$Carbon *2 # We want biomass not carbon. So, if C = biomass/2, we want to multiply the FVS carbon estimates by 2 to get biomass.
+agb = agb %>% select(-Carbon) # Remove Carbon variable
+# AGB is now actually AGB and not carbon
+```
+
+# Get FVS variables from FVS_Summary2 sheet
+```{r}
+# Get FVS_Summary2 table
+fvs = read_xlsx(here("fvs/output/Run_1_FVSoutput_1220_plots.xlsx"), sheet = "FVS_Summary2")
+
+# Select only response variables needed
+fvs_2023_vars = fvs %>% select(StandID, TCuFt, MCuFt, BA, Tpa, QMD, SDI) 
+
+# Edit naming scheme
+fvs_2023_vars = fvs_2023_vars %>% rename(Plot = StandID) # rename StandID to Plot
+fvs_2023_vars = fvs_2023_vars %>% rename(TVOL = TCuFt) # rename TCuFt to TVOL (total volume)
+fvs_2023_vars = fvs_2023_vars %>% rename(MVOL = MCuFt) # rename MCuFt to MVOL (merchantable volume)
+fvs_2023_vars = fvs_2023_vars %>% rename(TPA = Tpa) # rename Tpa to TPA
+```
+
+Add in Basal area weighted mean diameter (bawmd) response variable
+```{r}
+# BAWMD excludes dead trees
+
+# Read in trees FVS data to calculate BAWMD
+trees = read_excel(here("fvs/output/Run_1_FVSoutput_1220_plots.xlsx"), sheet = "FVS_TreeList")
+trees = trees %>% rename(Plot = StandID) # rename StandID to Plot for joining
+trees$Plot = as.numeric(trees$Plot) # make sure plot column is numeric
+trees = trees %>% select(Plot, DBH, TPA) # subset trees df to only plot, DBH, and TPA columns 
+trees = trees %>%  filter(!(TPA == 0)) # remove dead trees from trees dataframe. Recorded in FVS as TPA = 10 if live or dying and recorded as TPA = 0 if dead.
+field_data_df_transformed_subset = field_data_df_transformed %>% select(Plot) # subset field_data_filtered to only the plot column to rejoin tree-less plots to dataframe before writing table
+
+# Calculate BAWMD
+bawmd2 = trees %>%
+  mutate(
+    BA_tree = DBH^2 * 0.005454) %>% # calculate basal area per tree in square feet
+  group_by(Plot) %>%
+  summarise(
+    BAWMD = sum(DBH * BA_tree, na.rm = TRUE) / sum(BA_tree, na.rm = TRUE), # multiply basal area of a tree by tree diameter and divide by the basal area of the tree. Sum for all trees in a plot to get BAWMD.
+    .groups = "drop")
+
+# Join BAWMD with field data plot numbers to include tree-less plots
+bawmd = bawmd2 %>%
+  left_join(field_data_df_transformed_subset, by = "Plot") 
+```
+
+Join all response variables together
+```{r}
+# Join response variables
+response_variables = agb %>%
+  left_join(fvs_2023_vars, by = "Plot")
+
+# Make Plot column numeric to join to BAWMD
+response_variables$Plot = as.numeric(response_variables$Plot)
+
+# Join BAWMD to response variables
+response_variables = response_variables %>%
+  left_join(bawmd, by = "Plot")
+
+# Remove NA values in BAWMD
+response_variables[is.na(response_variables)] = 0 
+
+# Write to excel
+write_xlsx(response_variables, here("response_variables/rev_102025/response_variables.xlsx"))
+response_variables = read_excel(here("response_variables/rev_102025/response_variables.xlsx"))
+```
+
+# Merge response variables, plot number, and plot geometry
+```{r}
+out = merge(field_data_utm_poly_plot, response_variables, by = "Plot")
+st_write(out, "D:/BH/Black_Hills_V102025/response_variables/rev_102025/response_vars_with_geom.gpkg")
+```
+
+### Data Cleanup for modeling
+
+Read in data
+```{r}
+# Read back in response variables and predictor metrics
+response_variables = read_excel(here("response_variables/rev_102025/response_variables.xlsx"))
+cloud_metrics = read_excel(here("cloud_metrics/rev_102025/cloud_metrics.xlsx"))
+topo_metrics = read_excel(here("topo_metrics/rev_102025/topo_metrics.xlsx"))
+climate_metrics = read_excel(here("climate_metrics/rev_102025/climate_metrics_annuals.xlsx"))
+```
+
+Merge variables
+```{r}
+# Join all metrics into one table
+metrics_1 = response_variables %>%
+  left_join(cloud_metrics, by = "Plot") %>%
+  left_join(topo_metrics, by = "Plot") %>%
+  left_join(climate_metrics, by = "Plot")
+```
+
+Remove NAs, remove 0 sum columns, make columns numeric, and write all metrics to table
+```{r}
+# Check data and remove any column or value issues
+metrics_1[is.na(metrics_1)] = 0 # remove NA values to run variable selection successfully
+metrics_2 = metrics_1[, colSums(metrics_1) != 0] # remove columns where sum is 0 
+#setdiff(colnames(metrics_1), colnames(metrics_2)) # see which columns where sum is 0
+metrics_2 = metrics_2 %>% mutate(across(everything(), as.numeric))# make sure columns are numeric class
+
+# Set output directory 
+output_dir = here("all_metrics_combined/rev_102025")
+dir.create(output_dir, recursive = T)
+
+# Write all metrics to table. This df has redundant variables that are removed in next step
+write_xlsx(metrics_2, here("all_metrics_combined/rev_102025/all_metrics_combined_w_corr_vars.xlsx"))
+```
+
+Remove selected redundant or unwanted variables from metrics dataframe before modeling
+```{r}
+# Read back in dataframe and remove redundant variables 
+metrics_2 = read_excel(here("all_metrics_combined/rev_102025/all_metrics_combined_w_corr_vars.xlsx"))
+
+# Remove redundant variables and variables not wanted in modeling (L-moments, KDE, pulse/point density, etc)
+metrics = metrics_2 %>%
+  select(-contains(c("1stReturns_Strata", "1stReturns_Lmoment", "1stReturns_4p5ftPlus_Lmoment", "AllReturns_Lmoment", "AllReturns_4p5ftPlus_Lmoment","AllReturns_KDE", "1stReturns_KDE", "1stReturns_4p5ftPlus_KDE", "AllReturns_4p5ftPlus_KDE", "AllReturns_4p5ftPlus_Lmoment_1", "1stReturns_4p5ftPlus_Height", "SD_BlackHills_D23_CanopyDensity_20m", "SD_BlackHills_D23_PulseDensity_20m", "SD_BlackHills_D23_PointDensity_20m"))) 
+
+# Write all metrics to table to be used in modeling
+write_xlsx(metrics, here("all_metrics_combined/rev_102025/all_metrics_combined.xlsx"))
+
+# Read back in metrics
+metrics = read_excel(here("all_metrics_combined/rev_102025/all_metrics_combined.xlsx"))
+```
+
+### Variable Selection Using Random Forest [(VSURF)](https://cran.r-project.org/web/packages/VSURF/VSURF.pdf)
+For selection of optimal predictor metrics to be used in response variable modeling
+
+Create VSURF directories for outputs
+```{r}
+# Create base directory
+base_dir = here("vsurf/rev_102025")
+dir.create(base_dir)
+
+# Define the response variables
+response_vars = c("AGB", "TVOL", "MVOL", "BA", "SDI", "QMD", "BAWMD", "TPA")
+
+# Create folders for each response variable in the base directory
+for (i in seq_along(response_vars)) {
+  dir.create(file.path(base_dir, response_vars[i]), showWarnings = F, recursive = T)}
+```
+
+Run VSURF for each response variable and write outputs
+```{r}
+for (i in seq_along(response_vars)) {
+  response = response_vars[i]
+  seed_val = 317 + i  # set unique repeatable seed for each vsurf run
+  set.seed(seed_val)
+  
+  # Define predictors and response variable
+  predictors = metrics %>% select(-Plot, -all_of(setdiff(response_vars, response))) # remove Plot column and all other response variables from predictors
+  y = predictors[[response]] # define the response variable 
+  x = predictors %>% select(-all_of(response))  # remove the response variable from potential predictors
+
+  # Run VSURF using defaults
+  vsurf_result = VSURF(
+    x = x,
+    y = y,
+    mtry = max(floor(ncol(x) / 3), 1),
+    ntree.thres = 500,
+    nfor.thres = 20,
+    nmin = 1,
+    ntree.interp = 100,
+    nfor.interp = 10,
+    nsd = 1,
+    ntree.pred = 100,
+    nfor.pred = 10,
+    nmj = 1,
+    RFimplem = "ranger",
+    parallel = F,
+    verbose = T,
+    ntree = 2000)
+
+  # Define output folder for response variable
+  out_dir = file.path(base_dir, response)
+
+  # Define function to save variable names chosen in each VSURF step (thresholding, interpretation, and prediction)
+  save_varset = function(indices, name) {
+    var_names = names(x)[indices] # saves variable name based on vsurf-returned indicies 
+    write_xlsx(as.data.frame(var_names), file.path(out_dir, paste0("vsurf_", name, ".xlsx")))
+    }
+
+  # Save VSURF variable names chosen in each step
+  save_varset(vsurf_result$varselect.thres, "thres")
+  save_varset(vsurf_result$varselect.interp, "interp")
+  save_varset(vsurf_result$varselect.pred, "pred")
+
+  # Save selected variables from prediction step
+  selected_predictors = names(x)[vsurf_result$varselect.pred] # get the variables chosen in the VSURF prediction step
+  df_subset = x[, selected_predictors, drop = F] # subset original dataframe to selected predictors 
+  write_xlsx(df_subset, file.path(out_dir, "selected_predictors_names.xlsx")) # returns dataframe of predictors for modeling
+
+  # Save variable importance (%IncMSE)
+  imp = data.frame(
+    Predictor = names(x)[vsurf_result$imp.mean.dec.ind], # get names of each predictor variable
+    Imp_Mean_Dec = vsurf_result$imp.mean.dec, # get mean variable importance sorted in decreasing order
+    Imp_SD_Dec = vsurf_result$imp.sd.dec) # get standard deviation of variable importance 
+  
+  # Write importance to file
+  write_xlsx(imp, file.path(out_dir, "vsurf_importance.xlsx"))
+
+  # Save mean performance
+  write_xlsx(as.data.frame(vsurf_result$mean.perf), file.path(out_dir, "vsurf_mean_perf.xlsx"))
+  }
+```
+
+### TuneRanger
+For [tuning](https://cran.r-project.org/web/packages/tuneRanger/tuneRanger.pdf) of ranger random forest model hyperparameters 
+
+Create tuning and modeling directories for outputs
+```{r}
+# Define base directory paths
+tune_dir = here("tuneranger/rev_102025")
+model_dir = here("modeling/rev_102025")
+
+# Create base directories
+dir.create(tune_dir, recursive = T, showWarnings = F)
+dir.create(model_dir, recursive = T, showWarnings = F)
+
+# Create subdirectories
+for (i in seq_along(response_vars)) {
+  dir.create(file.path(tune_dir, response_vars[i]), recursive = T, showWarnings = F)
+  dir.create(file.path(model_dir, response_vars[i], "modeling_df"), recursive = T, showWarnings = F)}
+```
+
+Run tuneRanger
+```{r}
+# Loop through response variables
+for (i in seq_along(response_vars)) {
+  response = response_vars[i]
+  seed_val = 555 + i  # set unique and repeatable seed for each run
+  set.seed(seed_val)
+  
+  # Read VSURF-selected predictors for response variable, get selected predictors column names, and write dataframe to file
+  predictors_path = file.path(here("vsurf/rev_102025"), response, "selected_predictors_names.xlsx")
+  selected_metrics = read_excel(predictors_path)
+  selected_columns = colnames(selected_metrics) # get names of selected predictors
+  selected_columns = c(selected_columns, response)  # include response variable in selected predictors dataframe
+  subset_metrics = metrics[, selected_columns, drop = F]   # subset modeling dataframe
+  modeling_df_path = file.path(model_dir, response, "modeling_df", "modeling_df.xlsx")# save modeling dataframe
+  write_xlsx(subset_metrics, modeling_df_path) # write to excel
+
+  # Read modeling dataframe back in 
+  subset_metrics = read_excel(modeling_df_path)
+  subset_metrics = as.data.frame(subset_metrics)
+  
+  # Create regression task
+  rf.task = makeRegrTask(id = paste0(response, "_Task"), data = subset_metrics, target = response)
+  
+  # Run tuneRanger 
+  rf.tune = tuneRanger(
+  rf.task,
+  measure = NULL,
+  iters = 100,
+  iters.warmup = 30,
+  time.budget = NULL,
+  num.threads = 20,
+  num.trees = 1000,
+  parameters = list(replace = T, respect.unordered.factors = "order"),
+  tune.parameters = c("mtry", "min.node.size", "sample.fraction"), # tune these parameters
+  save.file.path = NULL,
+  build.final.model = T,
+  show.info = getOption("mlrMBO.show.info", T))
+  
+  # Write tuneRanger results to file
+  write_xlsx(as.data.frame(rf.tune$recommended.pars),
+             file.path(tune_dir, response, "recommended_pars.xlsx"))
+  
+  write_xlsx(as.data.frame(rf.tune$results),
+             file.path(tune_dir, response, "tune_result.xlsx"))}
+```
+
+### Modeling
+
+Create ranger random forest models for each response variable using VSURF predictor metrics and tuneRanger hyperparameters
+```{r}
+# Define directories for modeling dataframe, hyperparameters, and modeling output
+model_dir = here("modeling/rev_102025")
+tune_dir = here("tuneranger/rev_102025")
+output_dir = here("modeling/rev_102025")
+
+# Run ranger model  
+for (i in seq_along(response_vars)) {
+  response = response_vars[i] # loop through response variables
+  seed_val = 999 + i # set unique and repeatable seed for each model run
+  set.seed(seed_val)
+
+  # Define file paths for data
+  df_path = file.path(model_dir, response, "modeling_df", "modeling_df.xlsx") # modeling dataframe with selected predictors values and response variable
+  pars_path = file.path(tune_dir, response, "recommended_pars.xlsx") # tuneranger parameters
+  
+  # Define output directories for models
+  out_response_dir = file.path(output_dir, response)
+  dir.create(file.path(out_response_dir, "outputs"), recursive = T, showWarnings = F) # for modeling outputs
+  dir.create(file.path(out_response_dir, "plots"), recursive = T, showWarnings = F) # for plots of model performance metrics
+
+  # Read modeling dataframe and tuneranger parameters
+  df = read_xlsx(df_path)
+  rftune = read_xlsx(pars_path)
+
+  # Define a random 70/30 train/test split of data
+  train_indices = sample(nrow(df), 0.7 * nrow(df))
+  df.train = df[train_indices, ] 
+  df.test = df[-train_indices, ] # all rows not in df.train used for hold out testing of model
+
+  # Train ranger random forest model for each response variable
+  mod = ranger(
+    formula = as.formula(paste(response, "~ .")), # models response variable using all other predictor metrics in dataframe
+    data = df.train, 
+    replace = T, # sampling with replacement
+    num.trees = 1000,
+    mtry = rftune$mtry, # uses tuneRanger parameters
+    min.node.size = rftune$min.node.size, # uses tuneRanger parameters
+    importance = "permutation", 
+    sample.fraction = rftune$sample.fraction) # uses tuneRanger parameters
+
+  # Use model to predict on hold-out test set
+  pred = predict(mod, data = df.test)$predictions
+  obs = df.test[[response]]  # define observed values
+
+  
+  # Combine predicted and observed into a dataframe
+  pred_obs_df = data.frame(
+    Response = response,
+    Observed = obs,
+    Predicted = pred
+  )
+
+  # Save to Excel 
+  write_xlsx(pred_obs_df, file.path(out_response_dir, "outputs", "predicted_vs_observed_test.xlsx"))
+
+  # Calculate model performance metrics
+  r2.mod = cor(pred, obs)^2 # R^2
+  rmse.mod = sqrt(mean((pred - obs)^2)) # RMSE
+  rRMSE = rmse.mod / mean(obs) # relative RMSE
+  bias = mean(pred - obs) # bias
+
+  # Create a dataframe of the model performance metrics
+  results_df = data.frame(
+    metric = c("R2", "RMSE", "rRMSE", "Bias"),
+    value = c(r2.mod, rmse.mod, rRMSE, bias))
+
+  # Create a dataframe of permutation variable importance
+  varimp_df = data.frame(
+    Variable = names(mod$variable.importance),
+    Importance = mod$variable.importance)
+
+  # Predict on training set to calculate Fit Statistics
+  pred.train =  predict(mod, data = df.train)$predictions
+  obs.train = df.train[[response]]
+  
+  # Calculate fit statistics
+  r2.mod.fit = cor(pred.train, obs.train)^2 # R^2
+  rmse.mod.fit = sqrt(mean((pred.train - obs.train)^2)) # RMSE
+  rRMSE.fit = rmse.mod.fit / mean(obs.train) # relative RMSE
+  bias.fit = mean(pred.train - obs) # bias
+
+  # Create a dataframe of the fit_statistics
+  fit_statistics = data.frame(
+  metric = c("R2", "RMSE", "rRMSE", "Bias"),
+  value = c(r2.mod.fit, rmse.mod.fit, rRMSE.fit, bias.fit))
+
+  # Save model and modeling outputs
+  saveRDS(mod, file.path(out_response_dir, "outputs", "rf_model_ranger.rds")) # actual model
+  write_xlsx(results_df, file.path(out_response_dir, "outputs", "performance_metrics_ranger.xlsx")) # model performance metrics
+  write_xlsx(varimp_df, file.path(out_response_dir, "outputs", "varimp_ranger.xlsx")) # variable importance
+  write_xlsx(fit_statistics, file.path(out_response_dir, "outputs", "fit_statistics.xlsx")) # fit_statistics
+  
+  # Plot the predicted and observed values of the response variable
+  df_plot = data.frame(Predicted = pred, Observed = obs)
+  p1 = ggplot(df_plot, aes(x = Predicted, y = Observed)) +
+    geom_point(color = "blue", size = 2, alpha = 0.7) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") + # add 1:1 line
+    labs(title = paste("Predicted vs Observed", response),
+         x = paste("Predicted"),
+         y = paste("Observed")) +
+  theme_minimal() +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 18),
+    axis.title = element_text(size = 16),
+    axis.text = element_text(size = 16),
+    panel.grid = element_blank()  # removes gridlines
+  )  
+  
+  # Save plot
+  ggsave(filename = file.path(out_response_dir, "plots", "pred_v_obs2.png"),
+         plot = p1, width = 8, height = 8, units = "in", dpi = 400)
+
+  # Create variable importance plot
+  p2 = ggplot(varimp_df, aes(x = reorder(Variable, Importance), y = Importance)) +
+    geom_point(color = "black", size = 2) +
+    coord_flip() +
+    labs(title = paste(response, "Variable Importance"),
+         x = "Variable",
+         y = "%IncMSE") +
+    theme_minimal() +
+    theme(axis.text.y = element_text(size = 8))
+  
+  # Save plot
+  ggsave(filename = file.path(out_response_dir, "plots", "varimp_IncMSE.png"),
+         plot = p2, width = 6, height = 8, units = "in", dpi = 300)
+
+  # Plot the predicted and observed values of the response variable fit statistics
+  df_plot_3 = data.frame(Predicted = pred.train, Observed = obs.train)
+  p3 = ggplot(df_plot_3, aes(x = Predicted, y = Observed)) +
+    geom_point(color = "blue", size = 2, alpha = 0.7) +
+    geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") + # add 1:1 line
+    labs(title = paste("Training Data Predicted vs Observed", response),
+         x = paste("Predicted"),
+         y = paste("Observed")) +
+    theme_minimal() +
+    theme(
+      plot.title = element_text(hjust = 0.5, size = 18),
+      axis.title = element_text(size = 16),
+      axis.text = element_text(size = 16),
+      panel.grid = element_blank()  # removes gridlines
+   ) 
+  # Save plot
+  ggsave(filename = file.path(out_response_dir, "plots", "train_pred_v_obs2.png"),
+         plot = p3, width = 8, height = 8, units = "in", dpi = 400)
+  }
+
+```
+
+Modeling Performance Metric Results
+```{r}
+# Define base directory of modeling outputs 
+base_dir = here("modeling/rev_102025")
+
+# Get all response variable folders 
+response_folders = list.dirs(base_dir, recursive = FALSE)
+
+# Initialize list to hold results
+results_list = list()
+
+# Loop over each response variable folder to get performance metrics table
+for (folder in response_folders) {
+  metrics_file = file.path(folder, "outputs", "performance_metrics_ranger.xlsx")
+  
+  if (file.exists(metrics_file)) {
+    response = basename(folder)  # get the name of the response variable
+    df = read_excel(metrics_file, col_names = c("metric", "value")) # define metric name and value of the metric 
+    
+    # Convert metrics from long to wide format 
+    df_wide = pivot_wider(df, names_from = metric, values_from = value)
+    df_wide = mutate(df_wide, Response_Variable = response)
+    
+    results_list[[response]] = df_wide
+  }
+}
+
+# Combine all results into one table
+summary_table = bind_rows(results_list) %>%
+  select(Response_Variable, R2, RMSE, rRMSE, Bias)
+summary_table = as.data.frame(summary_table) # convert to a dataframe
+
+# Make columns 2:5 numeric and round values to 2 digits
+summary_table = summary_table %>%
+  mutate(across(2:5, as.numeric)) %>%
+  mutate(across(where(is.numeric), \(x) round(x, digits = 2)))
+
+# Create output directory
+out_dir = here("results_tables_and_figures/rev_102025/")
+dir.create(out_dir, recursive = T, showWarnings = F)
+
+# Write to excel
+write_xlsx(summary_table, file.path(out_dir, "model_performance_metrics_summary_table.xlsx"))
+```
+
+Modeling Variables table
+```{r}
+# Define base directory of vsurf outputs
+base_dir = here("vsurf/rev_102025")
+
+# Get all subdirectories for each response variable
+response_folders = list.dirs(base_dir, recursive = FALSE)
+
+# Initialize list to store results
+results_list = list()
+
+# Loop through each folder
+for (folder in response_folders) {
+  metrics_file = file.path(folder, "vsurf_pred.xlsx")
+  
+  if (file.exists(metrics_file)) {
+    response = basename(folder)  # Get the response variable name
+    
+    # Read in the vsurf prediction variables table
+    df = read_excel(metrics_file)
+    
+    # Add the response variable name as a column
+    df$Response_Variable = response
+    
+    # Select columns
+    df = df %>%
+      select(Response_Variable, var_names)
+      results_list[[response]] = df
+  }
+}
+
+# Combine into one data frame
+var_table = bind_rows(results_list)
+
+# Get the metrics for each response variable in one column
+summary_table = var_table %>%
+  group_by(Response_Variable ) %>%
+  summarize(Metrics = paste(var_names, collapse = ", "), .groups = "drop")
+
+# Write to excel
+out_dir = here("results_tables_and_figures/rev_102025/")
+write_xlsx(summary_table, file.path(out_dir, "var_summary_table.xlsx"))
+    
+# Create another summary table where the prefixes are removed from the variable names for easier reading
+# Shorten names
+var_table$var_names = gsub("^SD_BlackHills_D23_|_20m$", "", var_table$var_names) 
+
+# Get the metrics for each response variable in one column
+summary_table1 = var_table %>%
+  group_by(Response_Variable) %>%
+  summarize(Metrics = paste(var_names, collapse = ", "), .groups = "drop")
+
+# Write to excel
+write_xlsx(summary_table1, file.path(out_dir, "var_summary_table_short.xlsx"))
+```
+
+### Prediction Rasters
+Predict response variables across prediction area in the Black Hills
+
+Read in all metrics, which includes cloud, topo, climate predictors and response variables
+```{r}
+# Read in cloudmetrics
+metrics = read_excel(here("all_metrics_combined/rev_102025/all_metrics_combined.xlsx"))
+
+# Read in Topometrics stack
+topo_metrics = rast(here("topo_metrics/rev_102025/topo_metrics_stack.tif"))
+
+# Read in Grid Metrics stack
+grid_metrics = rast(here("grid_metrics/rev_102025/grid_metrics_stack.tif"))
+
+# Read in Climate stack
+climate_stack = rast(here("climate_metrics/rev_102025/climate_metrics_stack_annuals.tif"))
+
+# Read in predefined prediction area
+pred_area = vect(here("geometry/prediction_area/Final_Strata_Dissolved_reproj.gpkg")) # already reprojected to the crs of the grid/topo metrics. 
+
+# Combine stacks of predictors to create individual raster predictor stacks for each response variable
+allmetrics = c(grid_metrics, topo_metrics, climate_stack) 
+```
+
+Create directories for prediction outputs
+```{r}
+# Define base directory
+base_dir = here("modeling/rev_102025")
+dir.create(base_dir, recursive = T, showWarnings = F)
+
+# Redefine response variables
+response_vars = c("AGB", "TVOL", "MVOL", "BA", "SDI", "QMD", "BAWMD", "TPA")
+
+# Create folders in each response variable sub-directory
+for (i in seq_along(response_vars)) {
+  dir.create(file.path(base_dir, response_vars[i]), recursive = T, showWarnings = F)
+  dir.create(file.path(base_dir, response_vars[i], "predictor_stack_full_extent"), recursive = T, showWarnings = F)
+  dir.create(file.path(base_dir, response_vars[i], "prediction_map_full_extent"), recursive = T, showWarnings = F)}
+```
+
+Generate raster stacks of predictor variables and write to tif files
+```{r}
+# Define paths
+model_dir = here("modeling/rev_102025")
+tune_dir = here("tuneranger/rev_102025")
+output_stack_dir = here("modeling/rev_102025")
+
+# Loop through response variables and create raster stacks based on response variables
+for (i in seq_along(response_vars)) {
+  response_var = response_vars[i]  
+
+  # Read selected predictors
+  predictors_df = read_excel(file.path(model_dir, response_var, "modeling_df", "modeling_df.xlsx"))
+  selected_columns = setdiff(colnames(predictors_df), response_var)
+
+  # Subset predictor raster stack to selected predictors
+  predictor_stack = subset(allmetrics, selected_columns)
+
+  # Write raster stack ro file
+  out_dir = file.path(output_stack_dir, response_var, "predictor_stack_full_extent")
+  out_path = file.path(out_dir, "predictor_stack_full_extent.tif")
+  writeRaster(predictor_stack, out_path, overwrite = T)}
+```
+
+Tile predictor stack for predicting on individual tiles to fix R memory issues
+```{r}
+# Define predictor stack base directory
+stack_dir = here("modeling/rev_102025")
+
+for (i in seq_along(response_vars)) {
+  response_var = response_vars[i]  
+
+  # Get predictor stack directory
+  stack_path = file.path(stack_dir, response_var, 
+                          "predictor_stack_full_extent", "predictor_stack_full_extent.tif")
+  # Set stack output path to tiles folder
+  stack_out_dir = file.path(stack_dir, response_var, "predictor_stack_full_extent", "tiles")
+  
+  # Create tiles folder
+  dir.create(stack_out_dir, recursive = T, showWarnings = F)
+  
+  # Read raster stack
+  pred_stack = rast(stack_path)
+  
+  # Get tile_ext = ceiling(dim(pred_stack)[1:2] / c(2,2)) # 4 tiles output is 4212 2860
+  
+  # Define tile extents
+  tile_ext = c(4212, 2860) # creates 4 tiles
+  
+  # Create tiles from predictor stack
+  make_tiles = makeTiles(pred_stack, tile_ext, filename= file.path(stack_out_dir, "tile_.tif"))
+  }
+```
+
+Generate prediction maps over full Black Hills extent
+```{r}
+# Define paths
+model_dir      = here("modeling/rev_102025")
+stack_tiles_dir = here("modeling/rev_102025")  # directory with 4 tiles
+output_dir     = here("modeling/rev_102025")
+
+# Loop over response variables
+for (response_var in response_vars) {
+  model_path      = file.path(model_dir, response_var, "outputs", "rf_model_ranger.rds")
+  pred_out_dir    = file.path(output_dir, response_var, "prediction_map_full_extent2")
+  dir.create(pred_out_dir, recursive = TRUE, showWarnings = FALSE)
+  pred_raster_path = file.path(pred_out_dir, "prediction_map_full_extent2.tif")
+  pred_pdf_path    = file.path(pred_out_dir, "prediction_map_full_extent2.pdf")
+  
+  # Load RF model
+  rf_model = readRDS(model_path)
+  
+  # Define directory to predictor stack tiles
+  stack_tiles_dir = file.path(stack_dir, response_var, "predictor_stack_full_extent", "tiles")
+
+  # List predictor stack tiff tiles
+  tile_files = list.files(
+    stack_tiles_dir, 
+    pattern = "\\.tif$", 
+    full.names = TRUE)
+  
+  # Predict on each tile and store predicted raster
+  pred_tiles = list() # initialize list to store predicted raster tiles
+  for (i in seq_along(tile_files)) {
+    tile_rast = rast(tile_files[i])
+    tile_pred_file = file.path(pred_out_dir, paste0("pred_tile_", i, ".tif"))
+    
+    # Predict on each raster tile and write to disk
+    pred_tile = predict(tile_rast, rf_model,
+                        filename = tile_pred_file,
+                        na.rm = TRUE,
+                        overwrite = TRUE)
+    
+    # Read back in predicted tiles
+    pred_tiles[[i]] = rast(tile_pred_file)
+  }
+  
+  # Merge predicted tiles together into one raster
+  prediction_map = do.call(terra::merge, pred_tiles)
+
+  # Set name of prediction raster to the response variable
+  names(prediction_map) = response_var  
+
+  # Save final prediction raster as tif
+  writeRaster(prediction_map, pred_raster_path, overwrite = TRUE)
+  
+  # Save also as PDF map
+   tmap_save(
+    tm_shape(prediction_map) +
+      tm_raster(style = "cont", palette = viridis(100)) +
+      tm_title(paste("Black Hills National Forest", response_var)),
+    filename = pred_pdf_path,
+    width = 7, height = 10
+  )
+
+}
+```
+
+Mask prediction rasters to the predefined prediction area
+```{r}
+for (response_var in response_vars) {
+  # Define input and output directories
+  input_tif  = file.path(base_dir, response_var, "prediction_map_full_extent2", "prediction_map_full_extent2.tif")
+  output_dir = file.path(base_dir, response_var, "prediction_map_full_extent_clip2")
+  output_tif = file.path(output_dir, paste0(response_var, "_prediction_map_full_extent_clip2.tif"))
+  pred_pdf_path = file.path(output_dir, paste0(response_var, "_prediction_map_full_extent_clip2.pdf"))
+  # Create output directories
+  if (!dir.exists(output_dir)) {
+    dir.create(output_dir, recursive = TRUE)
+    cat("Created output directory:", output_dir, "\n")
+  }
+
+  # Read prediction raster
+  r = rast(input_tif)
+
+  # Mask prediction raster to prediction area 
+  r_masked = mask(r, pred_area)
+
+  # Write masked raster to tif file
+  writeRaster(r_masked, output_tif, overwrite = TRUE)
+  
+  # Save also as PDF map
+   tmap_save(
+    tm_shape(r_masked) +
+      tm_raster(style = "cont", palette = viridis(100)) +
+      tm_title(paste("Black Hills National Forest", response_var)),
+    filename = pred_pdf_path,
+    width = 7, height = 10
+  )
+}
+```
+
+Output all full extent prediction maps to modeling folder
+```{r}
+# Define base directory
+base_dir = "D:/BH/Black_Hills_V102025/modeling/rev_102025"
+
+# Define output folder for all exported rasters
+combined_dir = file.path(base_dir, "all_pred_maps_full_ext2")
+
+# Create the combined directory 
+if (!dir.exists(combined_dir)) {
+  dir.create(combined_dir, recursive = TRUE)
+}
+
+for (response_var in response_vars) {
+
+  # Define input directory containing tifs
+  input_dir = file.path(base_dir, response_var, "prediction_map_full_extent2")
+  
+  # Read all tif files
+  tif_file = list.files(input_dir, "prediction_map_full_extent2.tif", full.names = TRUE)
+  r_stack = rast(tif_file)
+  
+  # Define output filename
+  output_tif = file.path(combined_dir, paste0(response_var, "_prediction_map_full_extent2.tif"))
+  
+  # Write to combined folder
+  writeRaster(r_stack, output_tif, overwrite = TRUE)
+  }
+```
+
+Output all full extent prediction maps to deliverables folder with correct naming scheme
+```{r}
+# Define the base directory
+base_dir = "D:/BH/Black_Hills_V102025/modeling/rev_102025"
+out_dir = "D:/BH/Black_Hills_V102025/deliverables"
+
+# Define output folder for all exported rasters
+combined_dir = file.path(base_dir, "all_pred_maps_full_ext2")
+
+# Create combined directory 
+if (!dir.exists(combined_dir)) {
+  dir.create(combined_dir, recursive = TRUE)
+}
+
+# Define output folder for deliverables rasters
+deliverable_dir = file.path(out_dir, "prediction_maps_full_extent")
+# Create directory 
+if (!dir.exists(deliverable_dir)) {
+  dir.create(deliverable_dir, recursive = TRUE)
+}
+
+
+for (response_var in response_vars) {
+
+  # Define directory containing masked tifs
+  input_dir = file.path(base_dir, response_var, "prediction_map_full_extent2")
+  
+  # Read tif files
+  tif_file = list.files(input_dir, "prediction_map_full_extent2.tif", full.names = TRUE)
+  r = rast(tif_file)
+  
+  # Define new output filenames for deliverables
+  output_tif = file.path(deliverable_dir, paste0("SD_BlackHills_D23_", response_var, "_20m.tif"))
+    
+  # Define new output filenames for combined dir tifs
+  output_tif_combined = file.path(combined_dir, paste0("SD_BlackHills_D23_", response_var, "_20m.tif"))
+
+  # Set layer name to match the new output filenames
+  names(r) = tools::file_path_sans_ext(basename(output_tif))
+    
+  # Write rasters to folder
+  writeRaster(r, output_tif, overwrite = TRUE)
+  writeRaster(r, output_tif_combined, overwrite = TRUE)
+  }
+```
+
+Output all masked prediction maps to one folder
+```{r}
+# Define the base directory
+base_dir = "D:/BH/Black_Hills_V102025/modeling/rev_102025"
+out_dir = "D:/BH/Black_Hills_V102025/deliverables"
+
+# Define output folder for all exported rasters
+combined_dir = file.path(base_dir, "all_pred_maps_full_ext_clip2")
+
+# Create combined directory 
+if (!dir.exists(combined_dir)) {
+  dir.create(combined_dir, recursive = TRUE)
+}
+
+# Define output folder for deliverable rasters
+deliverable_dir = file.path(out_dir, "prediction_maps_masked")
+# Create directory 
+if (!dir.exists(deliverable_dir)) {
+  dir.create(deliverable_dir, recursive = TRUE)
+}
+
+
+for (response_var in response_vars) {
+
+  # Define directory containing masked tifs
+  input_dir = file.path(base_dir, response_var, "prediction_map_full_extent_clip2")
+  
+  # Read tif files
+  tif_file = list.files(input_dir, pattern = "\\.tif$", full.names = TRUE)
+  r = rast(tif_file)
+  
+  # Define new output filename for deliverables folder 
+  output_tif = file.path(deliverable_dir, paste0("SD_BlackHills_D23_", response_var, "_20m.tif"))
+    
+  # Define new output filename for combined dir folder
+  output_tif_combined = file.path(combined_dir, paste0("SD_BlackHills_D23_", response_var, "_20m.tif"))
+
+  # Set layer name to match the new output filename for deliverables
+  names(r) = tools::file_path_sans_ext(basename(output_tif))
+    
+  # Write rasters to folder
+  writeRaster(r, output_tif, overwrite = TRUE)
+  writeRaster(r, output_tif_combined, overwrite = TRUE)
+  }
+```
+
+
+

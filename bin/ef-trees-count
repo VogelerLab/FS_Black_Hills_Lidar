@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+# Author: Daniel Rode
+
+
+"""Gather, process, and format experimental forest field data."""
+
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Import
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
+# Import standard libraries
+import sys
+from pathlib import Path
+
+# Import external libraries
+import pyogrio
+import pandas as pd
+from shapely import Point
+from geopandas import GeoDataFrame
+
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Constants
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
+from vogeler.const import EFOREST_PLOT_RADIUS
+
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
+# Parse command line arguments
+EFOREST_PLOTS_PATH = Path(sys.argv[1])  # Path to half-acre plot locations
+EFOREST_TREES_PATH = Path(sys.argv[2])  # Path to list of plot trees
+DST = Path(sys.argv[3])
+
+# Import data
+plots = pyogrio.read_dataframe(EFOREST_PLOTS_PATH)
+plots['geometry'] = plots.buffer(EFOREST_PLOT_RADIUS)
+plots['PLOT_ID'] = plots['Plot']
+
+trees = pyogrio.read_dataframe(EFOREST_TREES_PATH)
+trees['geometry'] = [
+    Point(x, y)
+    for x, y in zip(trees['Easting'], trees['Northing'])
+]
+trees = GeoDataFrame(
+    trees,
+    crs=plots.crs,
+)
+trees['PLOT_ID'] = trees.sjoin(plots)['PLOT_ID']
+trees['HT_2023_ft'] = pd.to_numeric(trees['HT.2023.feet'], errors='coerce')
+trees['DBH_2023_in'] = pd.to_numeric(trees['DBH.2023.inches'], errors='coerce')
+
+# Count number of trees in each plot
+tree_counts = (
+    trees['PLOT_ID']
+    .value_counts()
+    .reset_index()
+    .rename(columns={'count': 'tree_count'})
+    .sort_values(by='PLOT_ID')
+    .reset_index(drop=True)
+)
+
+# Save tree counts to plots dataframe
+plots = plots.merge(tree_counts, how='left', on='PLOT_ID')
+
+# Save data to file
+plots.to_file(DST)

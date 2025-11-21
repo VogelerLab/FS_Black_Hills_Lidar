@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# Author: Daniel Rode
+
+
+"""Locate tree tops (TAO points) using watershed on lidar, for field plots.
+
+FS field plots and experimental forest field plots."""
+
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Import
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
+# Import standard libraries
+import sys
+from pathlib import Path
+
+# Import in-house libraries
+from vogeler.sp import parallel
+
+# Import external libraries
+import pyogrio
+from geopandas import GeoDataFrame
+
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Constants
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
+from vogeler.const import TAO_PLOT_BUFF
+
+WORKER_EXE = 'itd-watershed'
+
+POINT_CLOUD_VPC = Path("PATH/TO/LIDAR/COLLECTION.vpc")
+
+CHM_0p5_PATH = Path("PATH/TO/0.5-METER/CHM.vrt or .tif")
+
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Functions
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
+def process_plot_set(
+    plots_df: GeoDataFrame,
+    plot_id_col: str,
+    plots_dir: Path,
+) -> None:
+    """Spawn worker for each plot (to identify tree tops)"""
+
+    jobs = []
+    for plot_id, plot_geom in zip(plots_df[plot_id_col], plots_df.geometry):
+        dst_dir = plots_dir / str(plot_id)
+        dst_dir.mkdir(exist_ok=True, parents=True)
+        for ws_ttops_path in dst_dir.glob('ws_crowns_*.fgb'):
+            dst_stem = (
+                ws_ttops_path
+                .name
+                .removesuffix('.fgb')
+                .replace("_crowns_", "_ttops_")
+            )
+            jobs += [(
+                '--bounds-wkt', plot_geom.wkt,
+                '--buffer', str(TAO_PLOT_BUFF),
+                str(dst_dir / "plot.las"),
+                str(ws_ttops_path),
+                str(dst_dir / f'{dst_stem}.fgb'),
+            )]
+
+    parallel(
+        jobs=jobs,
+        cmd=WORKER_EXE,
+        log_path=f"./{Path(WORKER_EXE).stem}-{plots_dir.name}-jobs.log",
+        resume_failed=True,
+    )
+
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Import
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
+# Parse command line arguments
+DST = Path(sys.argv[1])
+fs_1220_bounds_path = Path(sys.argv[2])
+
+# Ensure export directory exists
+DST.mkdir(exist_ok=True)
+
+# Import 1220 forest service field plot data
+fs_plots = pyogrio.read_dataframe(fs_1220_bounds_path)
+
+# Process FS plots in parallel, finding tree tops in each plot
+process_plot_set(fs_plots, 'Plot', DST / "fs")
+
+# Import experimental forest field plot data
+ef_plots = pyogrio.read_dataframe("./cache-ef-tree-count.fgb")
+
+# Process experimental forest plots in parallel, finding tree tops in each plot
+process_plot_set(ef_plots, 'PLOT_ID', DST / "ef")
+
+print("DONE")

@@ -1,0 +1,353 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+# Author: Daniel Rode
+
+
+"""Create second order derivative products.
+
+Run individual tree detection and crown segmentation on Black Hills point cloud
+collection.
+"""
+
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Import
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
+# Import standard libraries
+import os
+import sys
+import json
+import random
+import subprocess as sp
+from pathlib import Path
+
+# Import in-house libraries
+from vogeler.stdlib import print2
+from vogeler.stdlib import init_logger
+from vogeler.stdlib import sha1
+from vogeler.stdlib import dispatch
+from vogeler.stdlib import meters2feet
+from vogeler.sp import parallel
+from vogeler.sp import build_vpc
+
+# Import external libraries
+import pyogrio
+from shapely import force_2d
+from shapely.geometry import shape
+
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Constants
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
+# Tile buffer to avoid edge-effects
+from vogeler.const import TAO_PLOT_BUFF
+
+# Number of CPU cores available on machine
+MAX_WORKERS = os.cpu_count()
+
+# File paths to Black Hills lidar tile point clouds, CHMs, and DTM rasters
+LAS_FILE_EXTENTIONS = (
+    "*.laz",
+)
+LAS_DIR = Path(
+    "import",
+    "PATCHED_POINT_CLOUDS_DIR",
+)
+DTM_TIF = Path(
+    "import",
+    "PATCHED_DTM.vrt",
+)
+CHM_TIF = Path(
+    "import",
+    "CHM_HALF_METER_RES.tif",
+)
+
+# Clipping polygons
+CLIPPING_SHPS_DIR = Path('/import/CLIPPING_SHPS_DIR/')
+BH_FS_BOUNDS_SHP = CLIPPING_SHPS_DIR / 'BHNF_BOUNDARY.fgb'
+
+# Vector file layer name
+ITD_LAYER_NAME = "TAO_points"
+SEG_LAYER_NAME = "TAO_crowns"
+
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Functions
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
+def shuffle(x: list) -> list:
+    x = list(x)  # Copy list
+    random.shuffle(x)  # Shuffles in-place
+
+    return x
+
+
+def get_tmp_dst(final_path: Path) -> Path:
+    return Path(
+        final_path.parent,
+        f"tmp_{final_path.name}",
+    )
+
+
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Main
+# -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+
+# Parse command line arguments
+try:
+    DST = Path(sys.argv[1])
+except IndexError:
+    print2("Specify destination directory for products")
+    sys.exit(1)
+
+# Ensure product output directory exists
+DST.mkdir(exist_ok=True, parents=True)
+
+# Setup logging
+log = init_logger(DST / "00_workflow.log")
+
+# Virtually stitch point cloud tiles together
+vpc_path = DST / "01_ctg.vpc"
+if not vpc_path.exists():
+    print("Catalogging point cloud collection...")
+    tile_list = [
+        tile_path
+        for file_ext in LAS_FILE_EXTENTIONS
+        for tile_path in LAS_DIR.glob(file_ext, case_sensitive=False)
+    ]
+    build_vpc(tile_list, vpc_path)
+
+# NOTE:
+#
+# Run `ef-trees-count EFOREST_PLOTS_PATH EFOREST_TREES_PATH ./cache-ef-tree-count.fgb`
+# where 'EFOREST_PLOTS_PATH' is the path to the shapefile that contains the
+# point locations of half-acre experimental forest plots and
+# 'EFOREST_TREES_PATH' is the path to the
+# shapefile of all trees from those plots.
+#
+# Run `fit-lmf-window-functions ./lmf_wf_models/ FVS_XLSX
+#
+# Run `itd-lmf-dispatch ./field_plots/ FS_1220_SHP ./lmf_wf_models/wf_set.r`
+# Run `seg-watershed-dispatch ./field_plots/ FS_1220_SHP`
+# Run `itd-watershed-dispatch ./field_plots/ FS_1220_SHP`
+# Run `seg-dalponte-dispatch ./field_plots/ FS_1220_SHP`
+#
+# Run `score-itd ./itd-scores/ FVS_1220_SHP ./field_plots/`
+#
+# Run `fscore-itd EFOREST_PLOTS_PATH EFOREST_TREES_PATH ./field_plots/ef/`
+
+# Spawn workers for each tile to identify tree tops and do segmentation
+print("Spawning ITD/segmentation workers...")
+tile_products_dir = DST / "02_tile_itd_seg"
+
+with open(vpc_path, 'r') as f:
+    stac = json.load(f)
+
+jobs = []
+# Shuffle asset order so that a series of dense tiles are unlikely to be
+# processed at the same time and overwhelm system RAM
+asset_set = shuffle(stac['features'])
+for asset in asset_set:
+    crs = asset['properties']['proj:wkt2']
+    geom = force_2d(shape(asset['properties']['proj:geometry']))
+
+    tile_id = sha1(geom.wkt)
+    dst_dir = tile_products_dir / tile_id
+
+    if (dst_dir / 'crowns.fgb').exists():
+        print("Exists (skipping):", dst_dir)
+        continue
+    if (dst_dir / 'EMPTY.txt').exists():
+        print("Empty (skipping):", dst_dir)
+        continue
+
+    jobs += [(
+        '--bounds-wkt', geom.wkt,
+        '--buffer', str(TAO_PLOT_BUFF),
+        str(vpc_path),
+        str(DTM_TIF),
+        str(CHM_TIF),
+        str(dst_dir),
+    )]
+
+parallel(
+    jobs, 'locate+segment-trees',
+    joblog=str(DST / "02_tile_parallel.log"),
+    max_procs=MAX_WORKERS,
+    # Minimum memory free when starting another jobs
+    memfree="80%",
+    # Suspend jobs when there is less memory available
+    memsuspend="90%",
+)
+
+# Spawn workers for each tile to clip identified tree tops to various FS bounds
+print("Spawning ITD clipping workers...")
+print("WARNING: Clipping geometries ought to have equvalent CRS to TOA!")
+
+jobs = []
+for tile_dir in tile_products_dir.iterdir():
+    tile_id = tile_dir.name
+
+    if (tile_dir / 'EMPTY.txt').exists():
+        print("Empty (skipping):", tile_id)
+        continue
+
+    for s in CLIPPING_SHPS_DIR.glob('*.fgb'):
+        dst = tile_dir / f'ttops_{s.stem}.fgb'
+        if dst.exists():
+            print("Exists (skipping):", dst)
+            continue
+
+        jobs += [(tile_dir / "ttops.fgb", s, dst)]
+
+
+def itd_clipper(params):
+    src, clipping_shp, dst = params
+
+    ttops = pyogrio.read_dataframe(src)
+    clipping_geom = pyogrio.read_dataframe(clipping_shp)
+
+    sel = ttops.intersects(clipping_geom.union_all())
+    clipped_ttops = ttops[sel]
+
+    clipped_ttops = clipped_ttops.rename(columns={"Z": "Ht_m"})
+    clipped_ttops["Ht_ft"] = clipped_ttops["Ht_m"].apply(meters2feet)
+
+    tmp_dst = get_tmp_dst(dst)
+    clipped_ttops.to_file(tmp_dst, layer=ITD_LAYER_NAME)
+    tmp_dst.rename(dst)
+
+    return dst
+
+
+for job_id, results in dispatch(
+    jobs, itd_clipper, max_workers=MAX_WORKERS,
+):
+    print("Clipping job finished:", job_id)
+
+# Spawn workers for each tile to clip identified crowns to various FS bounds
+print("Spawning segmentation clipping workers...")
+
+jobs = []
+for tile_dir in tile_products_dir.iterdir():
+    tile_id = tile_dir.name
+
+    if (tile_dir / 'EMPTY.txt').exists():
+        print("Tile marked empty (skipping):", tile_id)
+        continue
+
+    crowns_path = tile_dir / 'crowns.fgb'
+    if not crowns_path.exists():
+        print("Crowns not found (skipping):", tile_id)
+        continue
+
+    for ttops_path in tile_dir.glob("ttops_*.fgb"):
+        dst_fgb = Path(
+            tile_dir,
+            ttops_path.name.replace("ttops_", "crowns_"),
+        )
+        if dst_fgb.exists():
+            print("Exists (skipping):", dst_fgb)
+            continue
+
+        jobs += [ttops_path]
+
+
+def seg_clipper(ttops_path):
+    tile_id = ttops_path.parent.name
+
+    dst_fgb = Path(
+        tile_products_dir,
+        tile_id,
+        ttops_path.name.replace("ttops_", "crowns_"),
+    )
+
+    clipped_ttops = pyogrio.read_dataframe(ttops_path)
+    crowns = pyogrio.read_dataframe(
+        Path(tile_products_dir, tile_id, "crowns.fgb")
+    )
+
+    clipped_crowns = crowns.merge(
+        clipped_ttops[['bh_tree_id', 'Ht_m', 'Ht_ft']],
+        how='inner',
+        on='bh_tree_id',
+    )
+
+    tmp_dst_fgb = get_tmp_dst(dst_fgb)
+    clipped_crowns.to_file(tmp_dst_fgb, layer=SEG_LAYER_NAME)
+    tmp_dst_fgb.rename(dst_fgb)
+
+    return dst_fgb
+
+
+for job_id, results in dispatch(
+    jobs, seg_clipper, max_workers=MAX_WORKERS // 2,
+):
+    print("Clipping job finished:", job_id)
+
+# Join/mosaic ITD product tiles
+for product in (
+    'ttops_bearlodge',
+    'ttops_fs',
+    'ttops_mystic',
+    'ttops_hell_canyon',
+    'ttops_northern_hills',
+):
+    dst_gdb = DST / f"03_{product}.gdb"
+    if dst_gdb.exists():
+        print("Exists (skipping):", dst_gdb)
+        continue
+
+    print(f"Stitching {product} tiles...")
+    assets = list(tile_products_dir.glob(f"**/{product}.fgb"))
+    cmd = [
+        'ogrmerge',
+        '-progress',
+        '-single',
+        '-skipfailures',
+        '-src_geom_type', 'POINT',
+        '-nln', str(ITD_LAYER_NAME),
+        '-o', str(dst_gdb),
+        *[str(i) for i in assets],
+    ]
+    sp.run(cmd, check=True)
+
+# Join/mosaic segmentation product tiles
+for product in (
+    'crowns_bearlodge',
+    'crowns_fs',
+    'crowns_mystic',
+    'crowns_hell_canyon',
+    'crowns_northern_hills',
+):
+    dst_gdb = DST / f"03_{product}.gdb"
+    if dst_gdb.exists():
+        print("Exists (skipping):", dst_gdb)
+        continue
+
+    print(f"Stitching {product} tiles...")
+    assets = list(tile_products_dir.glob(f"**/{product}.fgb"))
+    cmd = [
+        'ogrmerge',
+        '-progress',
+        '-single',
+        '-skipfailures',
+        '-src_geom_type', 'POLYGON',
+        '-nln', str(SEG_LAYER_NAME),
+        '-o', str(dst_gdb),
+        *[str(i) for i in assets],
+    ]
+    sp.run(cmd, check=True)
+
+# Notify that workflow is over
+log.info("DONE")
